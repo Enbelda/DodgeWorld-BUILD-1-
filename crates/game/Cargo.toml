@@ -1,0 +1,19 @@
+[package]
+name = "brawl_game"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "brawl_game"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brawl_game"
+path = "src/main.rs"
+
+[dependencies]
+bevy = "0.20.1"
+bevy_rapier3d = "0.37.0"
+brawl_ranked = { path = "../brawl_ranked" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"

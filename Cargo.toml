@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/brawl_ranked", "crates/game"]
+
+# Bevy is slow in debug builds: optimize dependencies, keep our own code quick to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
