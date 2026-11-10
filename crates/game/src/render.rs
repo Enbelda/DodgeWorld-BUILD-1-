@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 
 use crate::camera::FollowCamera;
-use crate::player::{LocalBody, FEET_OFFSET};
+use crate::player::{LocalBody, LockOn, FEET_OFFSET};
 use crate::session::{SessionSet, View};
-use crate::sim::{ball::BALL_RADIUS, BallState, PlayerId, Team, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT};
+use crate::sim::{ball::{BallKind, BALL_RADIUS}, BallState, PlayerId, Team, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT};
 
 /// Higher = snappier smoothing of remote positions.
 const SMOOTHING: f32 = 18.0;
@@ -20,6 +20,10 @@ struct Palette {
     ball_free: Handle<StandardMaterial>,
     ball_team: [Handle<StandardMaterial>; 2],
     ball_powered: Handle<StandardMaterial>,
+    /// Boomerang and slime balls: [resting, flying].
+    ball_boomerang: [Handle<StandardMaterial>; 2],
+    ball_slime: [Handle<StandardMaterial>; 2],
+    slimed_body: Handle<StandardMaterial>,
     capsule: Handle<Mesh>,
     visor_mesh: Handle<Mesh>,
     ball: Handle<Mesh>,
@@ -35,6 +39,10 @@ struct Avatar {
 #[derive(Component)]
 struct BallVis(usize);
 
+/// Red ring floating over the enemy we are locked on to.
+#[derive(Component)]
+struct LockMarker;
+
 /// Visor on the local body, so others' catch state reads the same way as ours.
 #[derive(Component)]
 struct LocalVisor;
@@ -43,10 +51,10 @@ pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, make_palette)
+        app.add_systems(Startup, (make_palette, spawn_lock_marker))
             // PostStartup: the local body is spawned during Startup.
             .add_systems(PostStartup, add_local_visor)
-            .add_systems(Update, (sync_avatars, sync_local_body, sync_balls).after(SessionSet));
+            .add_systems(Update, ((sync_avatars, sync_lock_marker).chain(), sync_local_body, sync_balls).after(SessionSet));
     }
 }
 
@@ -69,6 +77,15 @@ fn make_palette(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut ma
             emissive(&mut materials, Color::srgb(0.3, 0.5, 1.0), LinearRgba::rgb(0.4, 0.8, 3.0)),
         ],
         ball_powered: emissive(&mut materials, Color::srgb(1.0, 0.8, 0.2), LinearRgba::rgb(5.0, 3.5, 0.5)),
+        ball_boomerang: [
+            materials.add(Color::srgb(0.62, 0.35, 0.9)),
+            emissive(&mut materials, Color::srgb(0.75, 0.45, 1.0), LinearRgba::rgb(2.5, 0.8, 4.0)),
+        ],
+        ball_slime: [
+            materials.add(StandardMaterial { base_color: Color::srgb(0.35, 0.85, 0.3), perceptual_roughness: 0.15, ..default() }),
+            emissive(&mut materials, Color::srgb(0.4, 1.0, 0.35), LinearRgba::rgb(0.8, 4.0, 0.6)),
+        ],
+        slimed_body: emissive(&mut materials, Color::srgb(0.35, 0.85, 0.3), LinearRgba::rgb(0.2, 1.2, 0.15)),
         capsule: meshes.add(Capsule3d::new(BODY_RADIUS, half_segment)),
         visor_mesh: meshes.add(Cuboid::new(0.55, 0.18, 0.12)),
         ball: meshes.add(Sphere::new(BALL_RADIUS)),
@@ -117,7 +134,7 @@ fn sync_avatars(
         tf.rotation = tf.rotation.slerp(Quat::from_rotation_y(p.yaw), k);
         *vis = if p.alive() { Visibility::Inherited } else { Visibility::Hidden };
         if let Ok(mut m) = mats.get_mut(av.body) {
-            m.0 = palette.body[team_index(p.team)].clone();
+            m.0 = if p.slimed > 0.0 { palette.slimed_body.clone() } else { palette.body[team_index(p.team)].clone() };
         }
         if let Ok(mut m) = mats.get_mut(av.visor) {
             m.0 = if p.catching { palette.visor_catch.clone() } else { palette.visor.clone() };
@@ -159,11 +176,12 @@ fn sync_local_body(
 ) {
     let Some(me) = view.me() else { return };
     let (mut mat, mut vis) = body.into_inner();
-    mat.0 = palette.body[team_index(me.team)].clone();
+    mat.0 = if me.slimed > 0.0 { palette.slimed_body.clone() } else { palette.body[team_index(me.team)].clone() };
     *vis = if me.alive() { Visibility::Inherited } else { Visibility::Hidden };
     visor.into_inner().0 = if me.catching { palette.visor_catch.clone() } else { palette.visor.clone() };
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_balls(
     mut commands: Commands,
     time: Res<Time>,
@@ -172,8 +190,10 @@ fn sync_balls(
     body: Single<&Transform, (With<LocalBody>, Without<BallVis>)>,
     cam: Single<&FollowCamera>,
     mut balls: Query<(Entity, &BallVis, &mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
+    mut spin: Local<f32>,
 ) {
     let Some(snap) = view.snap.as_ref() else { return };
+    *spin += time.delta_secs() * 4.0;
     let k = smooth(time.delta_secs() * 1.5);
     let mut have = vec![false; snap.balls.len()];
 
@@ -195,13 +215,31 @@ fn sync_balls(
         }
         let powered_holder =
             |by: PlayerId| snap.players.iter().any(|p| p.id == by && p.powered && p.holding);
-        mat.0 = match b.state {
-            BallState::Free => palette.ball_free.clone(),
-            BallState::Held { by } if powered_holder(by) => palette.ball_powered.clone(),
-            BallState::Held { .. } => palette.ball_free.clone(),
-            BallState::Live { powered: true, .. } => palette.ball_powered.clone(),
-            BallState::Live { team, .. } => palette.ball_team[team_index(team)].clone(),
+        let flying = matches!(b.state, BallState::Live { .. } | BallState::Returning { .. });
+        let powered = match b.state {
+            BallState::Held { by } => powered_holder(by),
+            BallState::Live { powered, .. } => powered,
+            _ => false,
         };
+        mat.0 = match (b.kind, b.state) {
+            _ if powered => palette.ball_powered.clone(),
+            (BallKind::Normal, BallState::Live { team, .. }) => palette.ball_team[team_index(team)].clone(),
+            (BallKind::Normal, _) => palette.ball_free.clone(),
+            (BallKind::Boomerang, _) => palette.ball_boomerang[flying as usize].clone(),
+            (BallKind::Slime, _) => palette.ball_slime[flying as usize].clone(),
+        };
+        // Shape cues: the boomerang is a spinning disc, slime is a wobbly blob.
+        match b.kind {
+            BallKind::Normal => tf.scale = Vec3::ONE,
+            BallKind::Boomerang => {
+                tf.scale = Vec3::new(1.35, 0.55, 1.35);
+                tf.rotation = Quat::from_rotation_y(*spin * 3.0) * Quat::from_rotation_x(0.3);
+            }
+            BallKind::Slime => {
+                let w = 1.0 + 0.08 * (*spin * 9.0 + vis.0 as f32).sin();
+                tf.scale = Vec3::new(1.15 * w, 1.15 / w, 1.15 * w);
+            }
+        }
     }
 
     for (i, b) in snap.balls.iter().enumerate() {
@@ -213,5 +251,39 @@ fn sync_balls(
                 Transform::from_translation(Vec3::from_array(b.pos)),
             ));
         }
+    }
+}
+
+fn spawn_lock_marker(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
+    commands.spawn((
+        LockMarker,
+        Mesh3d(meshes.add(Torus::new(0.3, 0.42))),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.15, 0.1),
+            emissive: LinearRgba::rgb(6.0, 0.5, 0.3),
+            unlit: true,
+            ..default()
+        })),
+        Transform::default(),
+        Visibility::Hidden,
+    ));
+}
+
+/// Float the lock ring over the target's head and spin it.
+fn sync_lock_marker(
+    time: Res<Time>,
+    lock: Res<LockOn>,
+    avatars: Query<(&Avatar, &Transform), Without<LockMarker>>,
+    marker: Single<(&mut Transform, &mut Visibility), With<LockMarker>>,
+) {
+    let (mut tf, mut vis) = marker.into_inner();
+    let target = lock.0.and_then(|t| avatars.iter().find(|(a, _)| a.id == t));
+    match target {
+        Some((_, at)) => {
+            *vis = Visibility::Visible;
+            tf.translation = at.translation + Vec3::Y * (BODY_HEIGHT + 0.6);
+            tf.rotation = Quat::from_rotation_y(time.elapsed_secs() * 3.0);
+        }
+        None => *vis = Visibility::Hidden,
     }
 }

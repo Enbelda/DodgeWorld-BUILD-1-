@@ -15,6 +15,8 @@ const THREAT_RANGE: f32 = 8.0;
 const CATCH_SKILL: f32 = 0.35;
 /// Press catch when the ball is this many seconds away (inside the catch window).
 const CATCH_LEAD_SECS: f32 = 0.25;
+/// Chance a bot locks on before a throw.
+const BOT_LOCK_CHANCE: f32 = 0.35;
 
 #[derive(Clone, Debug, Default)]
 pub struct Brain {
@@ -26,6 +28,8 @@ pub struct Brain {
     pub judged: Option<(usize, bool)>,
     /// Which way we go around obstacles (+1 left, -1 right); sticks so we don't jitter.
     pub detour: f32,
+    /// Whether we lock on for the throw we are holding (rolled once per ball).
+    pub lock_this_throw: Option<bool>,
 }
 
 pub fn yaw_toward(dir: Vec3) -> f32 {
@@ -45,7 +49,18 @@ pub fn think(m: &mut Match, id: PlayerId, dt: f32) -> Vec<Action> {
         .iter()
         .filter(|p| p.team != me.team && p.alive())
         .min_by(|a, b| a.pos.distance(me.pos).total_cmp(&b.pos.distance(me.pos)))
-        .map(|p| p.pos);
+        .map(|p| (p.id, p.pos));
+
+    // Lock on to the nearest enemy for about half of our throws; let go otherwise.
+    if me.holding.is_none() {
+        brain.lock_this_throw = None;
+    }
+    let lock_roll = *brain.lock_this_throw.get_or_insert_with(|| m.rng.f32() < BOT_LOCK_CHANCE);
+    let want_lock = if me.holding.is_some() && lock_roll { enemy.map(|(id, _)| id) } else { None };
+    if want_lock != me.lock {
+        actions.push(Action::Lock { target: want_lock });
+    }
+    let enemy = enemy.map(|(_, pos)| pos);
 
     // Closest enemy ball flying at us.
     let threat = m
@@ -135,6 +150,10 @@ pub fn think(m: &mut Match, id: PlayerId, dt: f32) -> Vec<Action> {
 
     let mut pos = me.pos;
     let mut yaw = me.yaw;
+    if me.slime.is_some() {
+        // Stuck in slime: the sim moves us; we can only turn and throw.
+        goal = None;
+    }
     if let Some(g) = goal {
         let d = Vec3::new(g.x - pos.x, 0.0, g.z - pos.z);
         if d.length() > 0.2 {
@@ -256,6 +275,7 @@ mod tests {
             secs += dt;
         }
         assert!(matches!(m.phase, Phase::Ended { .. }), "score after {secs}s: {:?}", m.score);
+        eprintln!("bot match took {secs:.0}s, score {:?}", m.score);
         assert!(m.score.contains(&KO_TARGET));
         for p in &m.players {
             assert!(p.pos.is_finite());

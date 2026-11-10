@@ -15,6 +15,24 @@
   - LAN lobby for 2-4 players over UDP: one peer hosts the match, others join. Actions resent
     until acked; timeouts; full-lobby/version rejection.
 
+- **Milestone 1 additions (requested after play-test).** 67 game tests + 23 ranked, clippy clean,
+  verified in a LAN autopilot match (locks, catches, boomerang returns, slime incl. on the client).
+  - Lock-on: Tab / middle mouse locks the enemy nearest the crosshair (40 m, 35 deg cone).
+    Camera tracks the target, throws home in (1.2 rad/s turn). Red ring over your target;
+    "LOCKED ON BY ..." warning for whoever is targeted. Bots lock on for ~35% of throws.
+  - Incoming-throw indicator: red "!" around the crosshair points at the closest enemy ball
+    flying at you (or homing on you), plus an INCOMING alert.
+  - Catch: hold RMB; the catch fires the moment a ball arrives (still must face it).
+    Moving is 40% slower while holding catch.
+  - Curve and lob 30% stronger (curve bend x1.3, lob peak height x1.3).
+  - Boomerang ball (purple disc): after hitting an opponent or any surface it flies back to the
+    thrower and arrives charged (next throw = full charge + speed bonus, normal damage).
+  - Slime ball (green blob): a hit does 1 damage, drags the target to the nearest wall/cover and
+    sticks them there (3 s total). They can still turn, throw and catch.
+  - 6 balls: 4 normal + boomerang and slime on the centre line (x = -13 / +13).
+  - Double jump (one extra jump in the air).
+  - Protocol bumped to 2 (old builds can't join new hosts).
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`

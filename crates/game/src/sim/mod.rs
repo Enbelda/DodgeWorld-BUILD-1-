@@ -8,7 +8,7 @@ pub mod layout;
 use bevy::math::Vec3;
 use serde::{Deserialize, Serialize};
 
-use ball::{ThrowParams, BALL_RADIUS};
+use ball::{BallKind, ThrowParams, BALL_RADIUS};
 use layout::{Aabb, ARENA_HALF};
 
 pub type PlayerId = u8;
@@ -27,6 +27,12 @@ pub const BODY_HEIGHT: f32 = 1.8;
 pub const HOLD_HEIGHT: f32 = 1.3;
 /// The ball must come at the catcher's front half to be caught.
 const CATCH_FACING: f32 = 0.0;
+/// Total time a slimed player is out of control (flying to the wall + stuck there).
+pub const SLIME_SECS: f32 = 3.0;
+/// How fast slime knocks a player toward the wall.
+pub const SLIME_KNOCK_SPEED: f32 = 18.0;
+/// Lock-on only works on enemies within this range.
+pub const LOCK_RANGE: f32 = 40.0;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Team {
@@ -58,7 +64,17 @@ pub enum Phase {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum Action {
     Throw { aim: [f32; 3], charge: f32, curve: f32, lob: bool },
+    /// Short catch window (bots). Humans hold the catch button instead, sent with their pose.
     Catch,
+    /// Lock on to an enemy (or clear the lock).
+    Lock { target: Option<PlayerId> },
+}
+
+/// A slimed player is dragged to `anchor` on the nearest wall and held there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slime {
+    pub anchor: Vec3,
+    pub timer: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -74,9 +90,16 @@ pub struct Player {
     pub holding: Option<usize>,
     /// The held ball was caught, so the next throw is powered.
     pub powered: bool,
+    /// A boomerang came back: the next throw is full charge plus the speed bonus.
+    pub charged: bool,
     pub catch_window: f32,
     pub catch_cooldown: f32,
+    /// Holding the catch button: catches the moment a ball arrives.
+    pub catch_held: bool,
     pub throw_cooldown: f32,
+    /// Enemy this player is locked on to; their throws home in on it.
+    pub lock: Option<PlayerId>,
+    pub slime: Option<Slime>,
     /// > 0 while knocked out.
     pub respawn_timer: f32,
     /// Bumped every time the host teleports this player (respawn), so clients snap to it.
@@ -96,6 +119,9 @@ impl Player {
     pub fn hold_point(&self) -> Vec3 {
         self.pos + Vec3::Y * HOLD_HEIGHT + self.forward() * 0.45
     }
+    pub fn catching(&self) -> bool {
+        self.catch_window > 0.0 || self.catch_held
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -104,7 +130,10 @@ pub enum BallState {
     Free,
     Held { by: PlayerId },
     /// Thrown and dangerous to `team` enemies until it touches something.
-    Live { thrower: PlayerId, team: Team, curve: f32, lob: bool, powered: bool },
+    /// `homing` is the locked-on target the ball steers toward.
+    Live { thrower: PlayerId, team: Team, curve: f32, lob: bool, powered: bool, homing: Option<PlayerId> },
+    /// A boomerang flying back to its thrower. Harmless; arrives charged.
+    Returning { owner: PlayerId },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +142,13 @@ pub struct Ball {
     pub vel: Vec3,
     pub state: BallState,
     pub pad: Vec3,
+    pub kind: BallKind,
+}
+
+impl Ball {
+    pub fn new(pad: Vec3, kind: BallKind) -> Self {
+        Ball { pos: pad, vel: Vec3::ZERO, state: BallState::Free, pad, kind }
+    }
 }
 
 /// Things that happened during a step, for HUD messages and sounds.
@@ -121,6 +157,8 @@ pub enum GameEvent {
     Hit { thrower: PlayerId, target: PlayerId },
     Knockout { thrower: PlayerId, target: PlayerId },
     Caught { catcher: PlayerId, thrower: PlayerId },
+    Slimed { thrower: PlayerId, target: PlayerId },
+    BoomerangBack { owner: PlayerId },
     MatchStarted,
     MatchEnded { winner: Team },
 }
@@ -161,7 +199,7 @@ impl Match {
     pub fn reset_balls(&mut self) {
         self.balls = layout::ball_pads()
             .into_iter()
-            .map(|pad| Ball { pos: pad, vel: Vec3::ZERO, state: BallState::Free, pad })
+            .map(|(pad, kind)| Ball::new(pad, kind))
             .collect();
         for p in &mut self.players {
             p.holding = None;
@@ -193,9 +231,13 @@ impl Match {
             hp: MAX_HP,
             holding: None,
             powered: false,
+            charged: false,
             catch_window: 0.0,
             catch_cooldown: 0.0,
+            catch_held: false,
             throw_cooldown: 0.0,
+            lock: None,
+            slime: None,
             respawn_timer: 0.0,
             teleports: 0,
             kos: 0,
@@ -207,7 +249,7 @@ impl Match {
 
     pub fn remove_player(&mut self, id: PlayerId) {
         for b in &mut self.balls {
-            if b.state == (BallState::Held { by: id }) {
+            if b.state == (BallState::Held { by: id }) || b.state == (BallState::Returning { owner: id }) {
                 b.state = BallState::Free;
             }
         }
@@ -237,13 +279,23 @@ impl Match {
     }
 
     /// A human client reports where its body is (movement is client-side).
+    /// While slimed the host owns the position; only the facing is taken.
     pub fn set_pose(&mut self, id: PlayerId, pos: Vec3, yaw: f32) {
         if let Some(p) = self.player_mut(id) {
             if p.alive() && pos.is_finite() && yaw.is_finite() {
-                let lim = ARENA_HALF + 2.0;
-                p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
                 p.yaw = yaw;
+                if p.slime.is_none() {
+                    let lim = ARENA_HALF + 2.0;
+                    p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
+                }
             }
+        }
+    }
+
+    /// A human holds (or releases) the catch button.
+    pub fn set_catch_hold(&mut self, id: PlayerId, held: bool) {
+        if let Some(p) = self.player_mut(id) {
+            p.catch_held = held && p.alive();
         }
     }
 
@@ -310,6 +362,8 @@ impl Match {
         p.respawn_timer = 0.0;
         p.catch_window = 0.0;
         p.catch_cooldown = 0.0;
+        p.slime = None;
+        p.lock = None;
         p.teleports = p.teleports.wrapping_add(1);
     }
 
@@ -337,18 +391,31 @@ impl Match {
                 if !aim.is_finite() || aim.length_squared() < 1e-6 {
                     return;
                 }
-                let params = ThrowParams { charge, curve, lob, powered: p.powered };
+                let (powered, charged) = (p.powered, p.charged);
+                let charge = if charged { 1.0 } else { charge };
+                let params = ThrowParams { charge, curve, lob, powered: powered || charged };
                 let (vel, curve) = ball::launch(aim, params);
                 p.holding = None;
                 p.powered = false;
+                p.charged = false;
                 p.throw_cooldown = THROW_COOLDOWN;
-                let (team, origin) = (p.team, p.hold_point());
+                let (team, origin, lock) = (p.team, p.hold_point(), p.lock);
+                let homing = lock.filter(|t| self.valid_lock(team, *t));
                 let b = &mut self.balls[bi];
                 b.pos = origin;
                 b.vel = vel;
-                b.state = BallState::Live { thrower: id, team, curve, lob, powered: params.powered };
+                b.state = BallState::Live { thrower: id, team, curve, lob, powered, homing };
+            }
+            Action::Lock { target } => {
+                let team = self.players[pi].team;
+                self.players[pi].lock = target.filter(|t| self.valid_lock(team, *t));
             }
         }
+    }
+
+    /// Can someone on `team` lock on to `target`? It must be a living enemy.
+    fn valid_lock(&self, team: Team, target: PlayerId) -> bool {
+        self.player(target).is_some_and(|t| t.team != team && t.alive())
     }
 
     pub fn step(&mut self, dt: f32) {
@@ -359,8 +426,28 @@ impl Match {
     }
 
     fn tick_players(&mut self, dt: f32) {
+        // Drop locks on targets that died, left or switched team.
+        let locks: Vec<Option<PlayerId>> =
+            self.players.iter().map(|p| p.lock.filter(|t| self.valid_lock(p.team, *t))).collect();
+        for (p, lock) in self.players.iter_mut().zip(locks) {
+            p.lock = lock;
+        }
         let mut to_respawn = Vec::new();
         for p in &mut self.players {
+            if let Some(sl) = p.slime.as_mut() {
+                let to = Vec3::new(sl.anchor.x - p.pos.x, 0.0, sl.anchor.z - p.pos.z);
+                let step = SLIME_KNOCK_SPEED * dt;
+                if to.length() <= step {
+                    p.pos.x = sl.anchor.x;
+                    p.pos.z = sl.anchor.z;
+                } else {
+                    p.pos += to.normalize() * step;
+                }
+                sl.timer -= dt;
+                if sl.timer <= 0.0 {
+                    p.slime = None;
+                }
+            }
             p.catch_window = (p.catch_window - dt).max(0.0);
             p.catch_cooldown = (p.catch_cooldown - dt).max(0.0);
             p.throw_cooldown = (p.throw_cooldown - dt).max(0.0);
@@ -412,16 +499,47 @@ impl Match {
                         ball::step(&mut b.pos, &mut b.vel, 0.0, g, dt, &self.solids);
                     }
                 }
-                BallState::Live { thrower, team, curve, lob, powered } => {
+                BallState::Live { thrower, team, curve, lob, powered, homing } => {
                     let g = ball::gravity(lob, true);
+                    let aim_at =
+                        homing.and_then(|t| self.player(t)).filter(|t| t.alive()).map(|t| t.pos + Vec3::Y * 1.0);
                     let b = &mut self.balls[bi];
+                    if let Some(target) = aim_at {
+                        ball::home(&mut b.vel, target - b.pos, dt, lob);
+                    }
                     let prev = b.pos;
                     let r = ball::step(&mut b.pos, &mut b.vel, curve, g, dt, &self.solids);
                     let now = b.pos;
                     if let Some(target) = self.first_enemy_hit(team, prev, now) {
                         self.resolve_hit(bi, thrower, target, powered);
                     } else if r.touched {
+                        let b = &mut self.balls[bi];
+                        b.state = match b.kind {
+                            BallKind::Boomerang => BallState::Returning { owner: thrower },
+                            _ => BallState::Free,
+                        };
+                    }
+                }
+                BallState::Returning { owner } => {
+                    let home =
+                        self.player(owner).filter(|p| p.alive()).map(|p| (p.hold_point(), p.holding.is_some()));
+                    let Some((at, hands_full)) = home else {
                         self.balls[bi].state = BallState::Free;
+                        continue;
+                    };
+                    let b = &mut self.balls[bi];
+                    if ball::fly_back(&mut b.pos, &mut b.vel, at, dt) {
+                        if hands_full {
+                            // Owner grabbed another ball meanwhile: drop it at their feet.
+                            b.state = BallState::Free;
+                        } else {
+                            b.state = BallState::Held { by: owner };
+                            if let Some(p) = self.player_mut(owner) {
+                                p.holding = Some(bi);
+                                p.charged = true;
+                            }
+                            self.events.push(GameEvent::BoomerangBack { owner });
+                        }
                     }
                 }
             }
@@ -458,7 +576,7 @@ impl Match {
         let t = &self.players[ti];
         let incoming = (-ball_vel).normalize_or_zero();
         let facing = Vec3::new(incoming.x, 0.0, incoming.z).normalize_or_zero().dot(t.forward());
-        if t.catch_window > 0.0 && t.holding.is_none() && facing > CATCH_FACING {
+        if t.catching() && t.holding.is_none() && facing > CATCH_FACING {
             let t = &mut self.players[ti];
             t.holding = Some(bi);
             t.powered = true;
@@ -469,9 +587,13 @@ impl Match {
             return;
         }
 
-        // Hit: the ball drops dead and bounces off.
+        // Hit: a boomerang heads home, anything else drops dead and bounces off.
         let b = &mut self.balls[bi];
-        b.state = BallState::Free;
+        let kind = b.kind;
+        b.state = match kind {
+            BallKind::Boomerang => BallState::Returning { owner: thrower },
+            _ => BallState::Free,
+        };
         b.vel = Vec3::new(-ball_vel.x * 0.15, 3.0, -ball_vel.z * 0.15);
 
         let dmg = if powered { MAX_HP } else { 1 };
@@ -479,10 +601,17 @@ impl Match {
         t.hp = t.hp.saturating_sub(dmg);
         if t.hp > 0 {
             self.events.push(GameEvent::Hit { thrower, target });
+            if kind == BallKind::Slime {
+                let anchor = layout::nearest_wall_anchor(self.players[ti].pos, &self.solids, BODY_RADIUS);
+                self.players[ti].slime = Some(Slime { anchor, timer: SLIME_SECS });
+                self.events.push(GameEvent::Slimed { thrower, target });
+            }
             return;
         }
         t.respawn_timer = RESPAWN_SECS;
         t.catch_window = 0.0;
+        t.catch_held = false;
+        t.slime = None;
         let counts = self.phase == Phase::Playing;
         if counts {
             t.deaths += 1;
@@ -493,6 +622,7 @@ impl Match {
             self.balls[held].vel = Vec3::Y * 2.0;
         }
         t.powered = false;
+        t.charged = false;
         self.events.push(GameEvent::Knockout { thrower, target });
         if counts {
             if let Some(k) = self.player_mut(thrower) {
@@ -522,6 +652,7 @@ impl Match {
                 let id = p.id;
                 self.players[pi].holding = Some(bi);
                 self.players[pi].powered = false;
+                self.players[pi].charged = false;
                 self.balls[bi].state = BallState::Held { by: id };
             }
         }
@@ -544,7 +675,10 @@ impl Match {
                     hp: p.hp,
                     holding: p.holding.is_some(),
                     powered: p.powered,
-                    catching: p.catch_window > 0.0,
+                    charged: p.charged,
+                    catching: p.catching(),
+                    lock: p.lock,
+                    slimed: p.slime.map_or(0.0, |s| s.timer),
                     catch_cooldown: p.catch_cooldown,
                     respawn_timer: p.respawn_timer.max(0.0),
                     teleports: p.teleports,
@@ -556,10 +690,7 @@ impl Match {
             balls: self
                 .balls
                 .iter()
-                .map(|b| BallView {
-                    pos: b.pos.to_array(),
-                    state: b.state,
-                })
+                .map(|b| BallView { pos: b.pos.to_array(), vel: b.vel.to_array(), state: b.state, kind: b.kind })
                 .collect(),
             events: self.events.clone(),
         }
@@ -601,8 +732,12 @@ pub struct PlayerView {
     pub hp: u8,
     pub holding: bool,
     pub powered: bool,
+    pub charged: bool,
     pub catching: bool,
     pub catch_cooldown: f32,
+    pub lock: Option<PlayerId>,
+    /// Seconds of slime left (0 = free).
+    pub slimed: f32,
     pub respawn_timer: f32,
     pub teleports: u32,
     pub kos: u32,
@@ -620,7 +755,9 @@ impl PlayerView {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct BallView {
     pub pos: [f32; 3],
+    pub vel: [f32; 3],
     pub state: BallState,
+    pub kind: BallKind,
 }
 
 /// Small deterministic RNG (xorshift64) so the sim has no extra dependencies.
@@ -659,7 +796,7 @@ mod tests {
         assert_eq!(m.player(blue).unwrap().team, Team::Blue);
         m.start();
         m.balls.clear();
-        m.balls.push(Ball { pos: LANE, vel: Vec3::ZERO, state: BallState::Free, pad: LANE + Vec3::Y * 0.3 });
+        m.balls.push(Ball::new(LANE, BallKind::Normal));
         m.set_pose(red, LANE, 0.0);
         m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), std::f32::consts::PI);
         m.step(DT); // picks up the ball at its feet
@@ -784,7 +921,7 @@ mod tests {
         let c = m.add_player("c", false).unwrap();
         m.start();
         m.players.retain(|p| !p.bot);
-        m.balls = vec![Ball { pos: LANE, vel: Vec3::ZERO, state: BallState::Free, pad: LANE }];
+        m.balls = vec![Ball::new(LANE, BallKind::Normal)];
         m.set_pose(a, LANE, 0.0);
         m.set_pose(c, LANE + Vec3::new(0.0, 0.0, -6.0), std::f32::consts::PI);
         m.step(DT);
@@ -805,7 +942,7 @@ mod tests {
         let mut m = Match::new();
         let red = m.add_player("red", false).unwrap();
         let blue = m.add_player("blue", false).unwrap();
-        m.balls = vec![Ball { pos: LANE, vel: Vec3::ZERO, state: BallState::Free, pad: LANE }];
+        m.balls = vec![Ball::new(LANE, BallKind::Normal)];
         m.set_pose(red, LANE, 0.0);
         m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), 0.0);
         m.step(DT);
@@ -848,6 +985,159 @@ mod tests {
         let (mut m, red, _blue) = duel();
         m.remove_player(red);
         assert_eq!(m.balls[0].state, BallState::Free);
+    }
+
+    /// Duel where red holds a ball of `kind`.
+    fn duel_with(kind: BallKind) -> (Match, PlayerId, PlayerId) {
+        let (mut m, red, blue) = duel();
+        m.balls[0].kind = kind;
+        (m, red, blue)
+    }
+
+    #[test]
+    fn held_catch_catches_whenever_the_ball_arrives() {
+        let (mut m, red, blue) = duel();
+        // Catch held well before the throw: no timing window needed.
+        m.set_catch_hold(blue, true);
+        run(&mut m, 1.0);
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.5);
+        let b = m.player(blue).unwrap();
+        assert_eq!(b.hp, MAX_HP);
+        assert_eq!(b.holding, Some(0));
+    }
+
+    #[test]
+    fn released_catch_does_not_catch() {
+        let (mut m, red, blue) = duel();
+        m.set_catch_hold(blue, true);
+        m.set_catch_hold(blue, false);
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1);
+    }
+
+    #[test]
+    fn lock_on_homes_onto_target() {
+        // Aim 15 degrees off: misses without a lock, hits with one.
+        let off = Vec3::new(-(0.26_f32).sin(), -0.05, -(0.26_f32).cos());
+        let (mut m, red, blue) = duel();
+        throw_at(&mut m, red, off);
+        run(&mut m, 1.0);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP, "no lock: miss");
+
+        let (mut m, red, blue) = duel();
+        m.apply(red, Action::Lock { target: Some(blue) });
+        assert_eq!(m.player(red).unwrap().lock, Some(blue));
+        throw_at(&mut m, red, off);
+        run(&mut m, 1.0);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "lock: homes in and hits");
+    }
+
+    #[test]
+    fn cannot_lock_on_teammate_and_lock_drops_on_knockout() {
+        let (mut m, red, blue) = duel();
+        m.apply(red, Action::Lock { target: Some(red) });
+        assert_eq!(m.player(red).unwrap().lock, None);
+        m.apply(red, Action::Lock { target: Some(blue) });
+        m.players.iter_mut().find(|p| p.id == blue).unwrap().hp = 1;
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.6);
+        assert!(!m.player(blue).unwrap().alive());
+        assert_eq!(m.player(red).unwrap().lock, None);
+    }
+
+    #[test]
+    fn boomerang_returns_charged_after_hitting_opponent() {
+        let (mut m, red, blue) = duel_with(BallKind::Boomerang);
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 1.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "it still hits");
+        let r = m.player(red).unwrap();
+        assert_eq!(r.holding, Some(0), "came back to the thrower");
+        assert!(r.charged, "and is charged");
+        assert!(!r.powered, "charged is not a one-hit knockout");
+        assert!(m.events.contains(&GameEvent::BoomerangBack { owner: red }));
+    }
+
+    #[test]
+    fn boomerang_returns_after_hitting_a_wall() {
+        let (mut m, red, blue) = duel_with(BallKind::Boomerang);
+        m.set_pose(blue, LANE + Vec3::new(5.0, 0.0, -10.0), 0.0); // out of the way
+        throw_at(&mut m, red, Vec3::new(0.0, 0.0, -1.0)); // at the far wall (z = -20)
+        let mut saw_return = false;
+        for _ in 0..240 {
+            m.step(DT);
+            saw_return |= matches!(m.balls[0].state, BallState::Returning { owner } if owner == red);
+        }
+        assert!(saw_return);
+        assert_eq!(m.player(red).unwrap().holding, Some(0));
+        assert!(m.player(red).unwrap().charged);
+    }
+
+    #[test]
+    fn charged_throw_is_full_speed_but_normal_damage() {
+        let (mut m, red, blue) = duel();
+        m.players.iter_mut().find(|p| p.id == red).unwrap().charged = true;
+        m.apply(red, Action::Throw { aim: [0.0, -0.05, -1.0], charge: 0.0, curve: 0.0, lob: false });
+        let speed = m.balls[0].vel.length();
+        assert!((speed - (ball::MAX_THROW_SPEED + ball::POWER_BONUS)).abs() < 0.5, "speed {speed}");
+        assert!(!m.player(red).unwrap().charged, "used up");
+        run(&mut m, 0.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1);
+    }
+
+    #[test]
+    fn normal_ball_does_not_return() {
+        let (mut m, red, _blue) = duel();
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 1.5);
+        assert!(!m.events.contains(&GameEvent::BoomerangBack { owner: red }));
+        assert!(!m.player(red).unwrap().charged);
+    }
+
+    #[test]
+    fn slime_sticks_target_to_nearest_wall() {
+        let (mut m, red, blue) = duel_with(BallKind::Slime);
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.5);
+        let b = m.player(blue).unwrap();
+        assert_eq!(b.hp, MAX_HP - 1);
+        let slime = b.slime.expect("slimed");
+        assert!(m.events.contains(&GameEvent::Slimed { thrower: red, target: blue }));
+        // Blue stood at x=14, z=-10: the cover block at (9, -12) is nearer than the x=20 wall.
+        let expected = layout::nearest_wall_anchor(LANE + Vec3::new(0.0, 0.0, -10.0), &m.solids, BODY_RADIUS);
+        assert_eq!(slime.anchor, expected);
+        assert!(expected.distance(LANE + Vec3::new(0.0, 0.0, -10.0)) < ARENA_HALF - LANE.x, "{expected}");
+        run(&mut m, 0.6);
+        let b = m.player(blue).unwrap();
+        assert!((b.pos.x - slime.anchor.x).abs() < 1e-3, "dragged to the wall");
+        // Client pose is ignored while stuck.
+        m.set_pose(blue, Vec3::new(0.0, 0.0, -5.0), 0.0);
+        assert!((m.player(blue).unwrap().pos.x - slime.anchor.x).abs() < 1e-3);
+        run(&mut m, SLIME_SECS);
+        assert!(m.player(blue).unwrap().slime.is_none(), "wears off");
+        m.set_pose(blue, Vec3::new(0.0, 0.0, -5.0), 0.0);
+        assert_eq!(m.player(blue).unwrap().pos.x, 0.0, "free to move again");
+    }
+
+    #[test]
+    fn slime_knockout_does_not_stick() {
+        let (mut m, red, blue) = duel_with(BallKind::Slime);
+        m.players.iter_mut().find(|p| p.id == blue).unwrap().hp = 1;
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.5);
+        let b = m.player(blue).unwrap();
+        assert!(!b.alive());
+        assert!(b.slime.is_none());
+    }
+
+    #[test]
+    fn match_has_one_boomerang_and_one_slime() {
+        let m = Match::new();
+        assert_eq!(m.balls.len(), 6);
+        assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Boomerang).count(), 1);
+        assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Slime).count(), 1);
     }
 
     #[test]

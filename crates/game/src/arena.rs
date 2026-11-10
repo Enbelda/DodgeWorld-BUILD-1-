@@ -3,6 +3,7 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
+use crate::sim::ball::BallKind;
 use crate::sim::layout::{self, ARENA_HALF, WALL_HEIGHT};
 
 pub struct ArenaPlugin;
@@ -27,7 +28,11 @@ fn spawn_arena(
     });
     let cover = materials.add(Color::srgb(0.85, 0.50, 0.25));
     let line = materials.add(Color::srgb(0.95, 0.95, 0.95));
-    let pad = materials.add(Color::srgb(0.75, 0.75, 0.70));
+    let pad_colors = [
+        (BallKind::Normal, materials.add(Color::srgb(0.75, 0.75, 0.70))),
+        (BallKind::Boomerang, materials.add(Color::srgb(0.62, 0.35, 0.9))),
+        (BallKind::Slime, materials.add(Color::srgb(0.35, 0.85, 0.3))),
+    ];
 
     // Floor: one collider, two tinted halves (Red at +Z, Blue at -Z).
     commands.spawn((Transform::from_xyz(0.0, -0.1, 0.0), Collider::cuboid(ARENA_HALF + 1.0, 0.1, ARENA_HALF + 1.0)));
@@ -41,8 +46,9 @@ fn spawn_arena(
         Transform::from_xyz(0.0, 0.01, 0.0),
     ));
     let pad_mesh = meshes.add(Cylinder::new(0.6, 0.02));
-    for p in layout::ball_pads() {
-        commands.spawn((Mesh3d(pad_mesh.clone()), MeshMaterial3d(pad.clone()), Transform::from_xyz(p.x, 0.01, p.z)));
+    for (p, kind) in layout::ball_pads() {
+        let mat = pad_colors.iter().find(|(k, _)| *k == kind).map(|(_, m)| m.clone()).unwrap_or_default();
+        commands.spawn((Mesh3d(pad_mesh.clone()), MeshMaterial3d(mat), Transform::from_xyz(p.x, 0.01, p.z)));
     }
 
     let covers = layout::cover();

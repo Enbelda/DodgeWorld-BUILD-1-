@@ -5,8 +5,8 @@
 use bevy::prelude::*;
 
 use crate::camera::FollowCamera;
-use crate::player::{Autopilot, LocalBody, MoveIntent, FEET_OFFSET};
-use crate::session::{LocalActions, View};
+use crate::player::{Autopilot, LocalBody, LockOn, MoveIntent, FEET_OFFSET};
+use crate::session::{CatchHold, LocalActions, View};
 use crate::sim::{bot::yaw_toward, Action, BallState, HOLD_HEIGHT};
 
 const THROW_EVERY: f32 = 1.4;
@@ -18,6 +18,7 @@ pub struct AutoState {
     throws: u32,
     last_pos: Option<Vec3>,
     caught_attempts: u32,
+    was_incoming: bool,
     strafe_timer: f32,
     strafe: f32,
 }
@@ -31,6 +32,8 @@ pub fn drive(
     mut cam: Single<&mut FollowCamera>,
     mut intent: ResMut<MoveIntent>,
     mut actions: ResMut<LocalActions>,
+    mut catch_hold: ResMut<CatchHold>,
+    mut lock: ResMut<LockOn>,
     mut st: Local<AutoState>,
 ) {
     if !auto.0 {
@@ -38,6 +41,7 @@ pub fn drive(
     }
     let dt = time.delta_secs();
     *intent = MoveIntent::default();
+    catch_hold.0 = false;
     let (Some(snap), Some(me)) = (view.snap.as_ref(), view.me()) else { return };
     if !me.alive() {
         return;
@@ -48,8 +52,17 @@ pub fn drive(
         .players
         .iter()
         .filter(|p| p.team != me.team && p.alive())
-        .map(|p| Vec3::from_array(p.pos))
-        .min_by(|a, b| a.distance(feet).total_cmp(&b.distance(feet)));
+        .map(|p| (p.id, Vec3::from_array(p.pos)))
+        .min_by(|a, b| a.1.distance(feet).total_cmp(&b.1.distance(feet)));
+
+    // Lock on to the nearest enemy while holding a ball.
+    let want_lock = if me.holding { enemy.map(|(id, _)| id) } else { None };
+    if want_lock != lock.0 {
+        lock.0 = want_lock;
+        info!("autopilot: lock {:?}", want_lock);
+        actions.0.push(Action::Lock { target: want_lock });
+    }
+    let enemy = enemy.map(|(_, pos)| pos);
 
     // Incoming enemy ball close by: face it and try to catch every other one.
     let chest = feet + Vec3::Y * 1.1;
@@ -60,15 +73,17 @@ pub fn drive(
         }
         _ => None,
     });
+    // Every other incoming ball: hold catch early and let it arrive.
+    if incoming.is_some() && !st.was_incoming {
+        st.caught_attempts += 1;
+        if st.caught_attempts % 2 == 1 && !me.holding {
+            info!("autopilot: holding catch");
+        }
+    }
+    st.was_incoming = incoming.is_some();
     if let Some(p) = incoming {
         cam.yaw = yaw_toward(Vec3::new(p.x - feet.x, 0.0, p.z - feet.z));
-        if !me.holding && !me.catching && me.catch_cooldown <= 0.0 && p.distance(chest) < 4.0 {
-            st.caught_attempts += 1;
-            if st.caught_attempts % 2 == 1 {
-                info!("autopilot: catch attempt");
-                actions.0.push(Action::Catch);
-            }
-        }
+        catch_hold.0 = !me.holding && st.caught_attempts % 2 == 1;
     }
 
     let goal = if me.holding {

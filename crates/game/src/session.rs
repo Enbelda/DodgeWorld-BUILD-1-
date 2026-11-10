@@ -59,6 +59,10 @@ impl View {
 #[derive(Resource, Default)]
 pub struct LocalActions(pub Vec<Action>);
 
+/// The local player is holding the catch button.
+#[derive(Resource, Default)]
+pub struct CatchHold(pub bool);
+
 pub fn build_session(cfg: &LaunchConfig) -> Result<(Session, String), String> {
     match &cfg.mode {
         Mode::Host { lan } => {
@@ -92,6 +96,7 @@ impl Plugin for SessionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<View>()
             .init_resource::<LocalActions>()
+            .init_resource::<CatchHold>()
             .add_systems(Update, (host_controls, tick_session).chain().in_set(SessionSet));
     }
 }
@@ -140,6 +145,7 @@ fn tick_session(
     mut session: ResMut<Session>,
     mut view: ResMut<View>,
     mut actions: ResMut<LocalActions>,
+    catch_hold: Res<CatchHold>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
@@ -152,6 +158,7 @@ fn tick_session(
         Session::Host(host) => {
             let local = host.local;
             host.sim.set_pose(local, feet, yaw);
+            host.sim.set_catch_hold(local, catch_hold.0);
             for a in actions.0.drain(..) {
                 host.sim.apply(local, a);
             }
@@ -190,7 +197,7 @@ fn tick_session(
             for a in actions.0.drain(..) {
                 net.push_action(a);
             }
-            net.send_update(feet, yaw, now);
+            net.send_update(feet, yaw, catch_hold.0, now);
             if net.receive(now) {
                 if let Some(s) = net.latest.as_mut() {
                     new_events = std::mem::take(&mut s.events);
@@ -217,6 +224,10 @@ fn tick_session(
             GameEvent::Caught { catcher, thrower } => {
                 format!("{} caught {}'s throw!", view.name_of(catcher), view.name_of(thrower))
             }
+            GameEvent::Slimed { thrower, target } => {
+                format!("{} got SLIMED by {}!", view.name_of(target), view.name_of(thrower))
+            }
+            GameEvent::BoomerangBack { owner } => format!("{}'s boomerang came back charged", view.name_of(owner)),
             GameEvent::MatchStarted => "Match started!".to_string(),
             GameEvent::MatchEnded { winner } => format!("{winner:?} team wins!"),
         };
