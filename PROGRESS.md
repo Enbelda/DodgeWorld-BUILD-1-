@@ -55,6 +55,28 @@
     Q/E still curve while charging a throw.
   - Protocol 3. Bots-only standard match now ~5.5 min (was ~2 with 2 HP).
 
+- **Milestone 1 round 4 (third play-test requests).** 112 game tests + 23 ranked, clippy clean.
+  Verified in LAN autopilot matches: perfect catches, ricochet knockbacks, tackles (incl. by the
+  joining client), dashes, slime, bricks, boomerangs, flips and spins; no errors.
+  - Lob solves its arc to come down on the top of the target's head (lock, else nearest enemy
+    to the aim).
+  - Catching: no damage from any ball while the catch window is open (only a ball you face is
+    caught; others bounce off).
+  - Slimed players are helpless: no throw, catch or turning (stunned/launched too).
+  - Dash (Ctrl): ground or air, 6 m in 0.12 s, 2 charges, 0.2 s between, both back 1.5 s after
+    the last dash. Invincible + glowing blue while dashing. Dashing into an enemy tackles them:
+    launched into the air (host flies them until they land) and their ball pops up.
+  - Curved throws at someone behind cover swing around it (side = the curve's bulge) and then
+    track the target.
+  - Perfect catch: a flashing red ring around the crosshair while catching now would be perfect
+    (ball < 0.15 s away). Perfect catch = powered + fully charged + one speed stack. Stacks make
+    the thrown ball x2/x3/x4/x5 base speed (max 4 stacks; literal doubling would reach 16x).
+  - Lock-on is only on while charging (nearest enemy); Tab/MMB while charging switches target.
+  - Wall ricochet: a live ball hitting a wall bounces back at double speed; if it hits anyone
+    it knocks them back (no damage, no points). Boomerangs still return instead.
+  - Sprint (Shift) 1.4x; a jump taken while sprinting carries 1.24x farther, dashes too.
+  - Protocol 4.
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`

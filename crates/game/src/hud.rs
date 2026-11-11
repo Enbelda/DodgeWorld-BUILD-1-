@@ -5,11 +5,12 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use crate::camera::{CursorLocked, FollowCamera};
-use crate::player::{Charge, LockOn};
+use crate::player::{Charge, LocalDash, LockOn, MoveIntent, DASH_CHARGES, DASH_RECHARGE};
 use crate::session::{SessionSet, View};
 use crate::sim::ball::BallKind;
 use crate::sim::{
     BallState, GameMode, MapId, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
+    PERFECT_SECS,
 };
 
 /// Enemy balls further than this are not shown as incoming.
@@ -27,6 +28,10 @@ enum HudText {
     /// Big warnings under the crosshair: incoming ball, locked on, slimed.
     Alert,
 }
+
+/// Flashing red ring around the crosshair: press catch now for a perfect catch.
+#[derive(Component)]
+struct PerfectRing;
 
 /// The red part of heart `0..HEARTS`; its width shows full, half or empty.
 #[derive(Component)]
@@ -76,13 +81,13 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_hud)
-            .add_systems(Update, (update_hud, update_hearts, place_incoming_marker).after(SessionSet));
+            .add_systems(Update, (update_hud, update_hearts, place_incoming_marker, perfect_ring).after(SessionSet));
     }
 }
 
-const CONTROLS: &str = "WASD move   Space jump (x2 in air)   Mouse aim\n\
-Hold LMB: charge (auto lock-on), release: throw   Q/E: curve   F: lob\n\
-RMB: catch - time it! (face the ball)   Tab/MMB: lock on/off\n\
+const CONTROLS: &str = "WASD move   Shift sprint   Ctrl dash/tackle   Space jump (x2 in air)\n\
+Hold LMB: charge (locks nearest), release: throw   Q/E: curve   F: lob\n\
+RMB: catch - time it! red ring = PERFECT   Tab/MMB while charging: switch target\n\
 In the air: Q/E spin 180   W+Q/E front flip   S+Q/E back flip   Esc: free mouse";
 
 fn spawn_hud(mut commands: Commands) {
@@ -115,7 +120,7 @@ fn spawn_hud(mut commands: Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                bottom: Val::Px(44.0),
+                bottom: Val::Px(72.0),
                 left: Val::Px(12.0),
                 column_gap: Val::Px(4.0),
                 ..default()
@@ -177,6 +182,19 @@ fn spawn_hud(mut commands: Commands) {
         })
         .with_children(|c| {
             c.spawn((text("+", 26.0), HudText::Crosshair));
+            c.spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Px(84.0),
+                    height: Val::Px(84.0),
+                    border: UiRect::all(Val::Px(5.0)),
+                    border_radius: BorderRadius::MAX,
+                    ..default()
+                },
+                BorderColor::all(Color::srgb(1.0, 0.1, 0.1)),
+                Visibility::Hidden,
+                PerfectRing,
+            ));
         });
     // Alerts, a bit below the crosshair.
     commands
@@ -258,12 +276,15 @@ fn bar(fraction: f32, width: usize) -> String {
     format!("[{}{}]", "|".repeat(filled), ".".repeat(width - filled))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     time: Res<Time>,
     view: Res<View>,
     charge: Res<Charge>,
     locked: Res<CursorLocked>,
     lock: Res<LockOn>,
+    dash: Res<LocalDash>,
+    intent: Res<MoveIntent>,
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
 ) {
     let snap = view.snap.as_ref();
@@ -353,7 +374,17 @@ fn update_hud(
                     } else {
                         "catch ready".to_string()
                     };
-                    let mut s = format!("{ball}   {catch}");
+                    let stacks = snap
+                        .and_then(|s| s.balls.iter().find(|b| b.state == BallState::Held { by: m.id }))
+                        .map_or(0, |b| b.stacks);
+                    let speed = if stacks > 0 { format!("  x{} SPEED", 1 + stacks) } else { String::new() };
+                    let dashes = if dash.charges == 0 {
+                        format!("DASH in {:.1}s", (DASH_RECHARGE - dash.since_last).max(0.0))
+                    } else {
+                        format!("DASH {}{}", "[#] ".repeat(dash.charges as usize), "[ ] ".repeat((DASH_CHARGES - dash.charges) as usize))
+                    };
+                    let sprint = if intent.sprint { "  SPRINT" } else { "" };
+                    let mut s = format!("{ball}{speed}   {catch}\n{dashes}{sprint}");
                     if let Some(c) = charge.amount(time.elapsed_secs()) {
                         s.push_str(&format!("\nPOWER {}", bar(c, 20)));
                     }
@@ -374,6 +405,39 @@ fn update_hud(
             text.0 = s;
         }
     }
+}
+
+/// Seconds until the closest enemy ball reaches `me`, if one is flying at them.
+pub fn closest_eta(snap: &Snapshot, me: &PlayerView) -> Option<f32> {
+    let chest = Vec3::from_array(me.pos) + Vec3::Y * 1.1;
+    snap.balls
+        .iter()
+        .filter(|b| matches!(b.state, BallState::Live { team, .. } if team != me.team) || matches!(b.state, BallState::Ricochet { .. }))
+        .filter_map(|b| {
+            let pos = Vec3::from_array(b.pos);
+            let vel = Vec3::from_array(b.vel);
+            let to_me = chest - pos;
+            let closing = vel.dot(to_me.normalize_or_zero());
+            (closing > 1.0 && vel.normalize_or_zero().dot(to_me.normalize_or_zero()) > 0.8)
+                .then(|| (to_me.length() - 0.75).max(0.0) / closing)
+        })
+        .min_by(|a, b| a.total_cmp(b))
+}
+
+/// Show the perfect-catch ring while a catch pressed now would be perfect.
+fn perfect_ring(
+    time: Res<Time>,
+    view: Res<View>,
+    ring: Single<(&mut Visibility, &mut BorderColor), With<PerfectRing>>,
+) {
+    let (mut vis, mut color) = ring.into_inner();
+    let ready = view.snap.as_ref().zip(view.me()).is_some_and(|(s, me)| {
+        me.alive() && !me.holding && !me.catching && me.catch_cooldown <= 0.0
+            && closest_eta(s, me).is_some_and(|eta| eta <= PERFECT_SECS)
+    });
+    *vis = if ready { Visibility::Inherited } else { Visibility::Hidden };
+    let pulse = 0.55 + 0.45 * (time.elapsed_secs() * 40.0).sin();
+    *color = BorderColor::all(Color::srgba(1.0, 0.1, 0.1, pulse));
 }
 
 fn update_hearts(
@@ -400,8 +464,11 @@ fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
     if me.stunned > 0.0 {
         lines.push(format!("KNOCKED FLAT! up in {:.1}s", me.stunned));
     }
+    if me.knocked {
+        lines.push("LAUNCHED!".to_string());
+    }
     if me.slimed > 0.0 {
-        lines.push(format!("SLIMED! stuck {:.1}s", me.slimed));
+        lines.push(format!("SLIMED! stuck and helpless {:.1}s", me.slimed));
     }
     if !incoming_balls(s, me).is_empty() {
         lines.push(if me.catching { "INCOMING - catching!".to_string() } else { "INCOMING!  RMB to catch".to_string() });
@@ -419,6 +486,29 @@ fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eta_only_for_balls_coming_at_me() {
+        let mut m = crate::sim::Match::new();
+        let me = m.add_player("me", false).unwrap();
+        let foe = m.add_player("foe", false).unwrap();
+        m.set_pose(me, Vec3::new(14.0, 0.0, 0.0), 0.0);
+        m.balls.truncate(1);
+        let team_foe = m.player(foe).unwrap().team;
+        m.balls[0].pos = Vec3::new(14.0, 1.1, -10.75);
+        m.balls[0].vel = Vec3::new(0.0, 0.0, 20.0);
+        m.balls[0].state = BallState::Live {
+            thrower: foe, team: team_foe, curve: 0.0, lob: false, powered: false, homing: None, track: None,
+        };
+        let snap = m.snapshot();
+        let mine = snap.players.iter().find(|p| p.id == me).unwrap();
+        let eta = closest_eta(&snap, mine).unwrap();
+        assert!((eta - 0.5).abs() < 0.01, "10 m at 20 m/s: {eta}");
+        m.balls[0].vel = Vec3::new(0.0, 0.0, -20.0);
+        let snap = m.snapshot();
+        let mine = snap.players.iter().find(|p| p.id == me).unwrap();
+        assert!(closest_eta(&snap, mine).is_none(), "flying away");
+    }
 
     #[test]
     fn hearts_fill_in_halves() {
@@ -451,7 +541,15 @@ mod tests {
         m.set_pose(me, Vec3::new(14.0, 0.0, 0.0), 0.0);
         m.balls.truncate(2);
         let team_foe = m.player(foe).unwrap().team;
-        let live = BallState::Live { thrower: foe, team: team_foe, curve: 0.0, lob: false, powered: false, homing: None };
+        let live = BallState::Live {
+            thrower: foe,
+            team: team_foe,
+            curve: 0.0,
+            lob: false,
+            powered: false,
+            homing: None,
+            track: None,
+        };
         // Ball 0 flies at me, ball 1 flies away.
         m.balls[0].pos = Vec3::new(14.0, 1.1, -10.0);
         m.balls[0].vel = Vec3::new(0.0, 0.0, 30.0);

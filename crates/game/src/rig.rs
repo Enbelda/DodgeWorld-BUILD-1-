@@ -63,6 +63,7 @@ pub struct Rig {
 pub struct LocalRigInput {
     pub charge: Option<f32>,
     pub trick: Option<TrickState>,
+    pub dashing: bool,
 }
 
 #[derive(Resource)]
@@ -83,6 +84,8 @@ pub struct RigAssets {
     visor_catch: Handle<StandardMaterial>,
     slimed: Handle<StandardMaterial>,
     flash: Handle<StandardMaterial>,
+    /// Glowing blue while dashing (invincible).
+    dash: Handle<StandardMaterial>,
 }
 
 pub fn make_rig_assets(
@@ -110,6 +113,7 @@ pub fn make_rig_assets(
         visor_catch: glow(&mut materials, Color::srgb(1.0, 1.0, 0.6), LinearRgba::rgb(4.0, 4.0, 1.5)),
         slimed: glow(&mut materials, Color::srgb(0.35, 0.85, 0.3), LinearRgba::rgb(0.2, 1.2, 0.15)),
         flash: glow(&mut materials, Color::WHITE, LinearRgba::rgb(8.0, 8.0, 8.0)),
+        dash: glow(&mut materials, Color::srgb(0.3, 0.6, 1.0), LinearRgba::rgb(1.0, 3.0, 9.0)),
     });
 }
 
@@ -343,10 +347,13 @@ pub fn animate_rigs(
             Team::Blue => 1,
         };
         let flashing = a.flash > 0.0;
+        let dashing = if is_local { local.dashing } else { pv.dashing };
         let slimed = pv.slimed > 0.0;
         for &(e, kind) in &r.parts {
             let Ok(mut m) = mats.get_mut(e) else { continue };
-            m.0 = if flashing {
+            m.0 = if dashing {
+                assets.dash.clone()
+            } else if flashing {
                 assets.flash.clone()
             } else {
                 match kind {

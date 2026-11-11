@@ -1,7 +1,7 @@
 //! `--autopilot`: drives the local player through the normal client path (move intent,
 //! camera yaw, queued actions) so the real app can be play-tested without a human.
-//! It cycles through straight, curved and lobbed throws, times catches, and every few
-//! seconds does a double-jump flip or an air spin.
+//! It cycles through straight, curved and lobbed throws, goes for perfect catches, sprints,
+//! dashes now and then, and every few seconds does a double-jump flip or an air spin.
 
 use bevy::prelude::*;
 
@@ -26,6 +26,7 @@ pub struct AutoState {
     trick_timer: f32,
     trick_step: u32,
     tricks: u32,
+    dash_timer: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,16 +78,18 @@ pub fn drive(
         }
         _ => None,
     });
-    // Every other incoming ball: press catch just before it arrives.
+    // Every other incoming ball: wait for the perfect-catch moment, then press catch.
     if incoming.is_some() && !st.was_incoming {
         st.caught_attempts += 1;
     }
     st.was_incoming = incoming.is_some();
-    let incoming = incoming.map(|(p, eta)| {
+    let eta = crate::hud::closest_eta(snap, me);
+    let incoming = incoming.map(|(p, _)| {
         cam.yaw = yaw_toward(Vec3::new(p.x - feet.x, 0.0, p.z - feet.z));
         let go = st.caught_attempts % 2 == 1;
-        if go && eta < 0.25 && !me.holding && !me.catching && me.catch_cooldown <= 0.0 {
-            info!("autopilot: timed catch");
+        let perfect_now = eta.is_some_and(|e| e <= crate::sim::PERFECT_SECS * 0.7);
+        if go && perfect_now && !me.holding && !me.catching && me.catch_cooldown <= 0.0 {
+            info!("autopilot: going for a perfect catch");
             actions.0.push(Action::Catch);
         }
         p
@@ -115,6 +118,14 @@ pub fn drive(
         let d = Vec3::new(g.x - feet.x, 0.0, g.z - feet.z);
         if d.length() > 0.5 {
             intent.dir = d.normalize();
+            // Sprint when the goal is far; dash toward it every few seconds.
+            intent.sprint = d.length() > 6.0;
+            st.dash_timer -= dt;
+            if st.dash_timer <= 0.0 && d.length() > 4.0 {
+                st.dash_timer = 5.0;
+                intent.dash = true;
+                info!("autopilot: dash");
+            }
             // Blocked (e.g. by the low wall)? Jump over it.
             if let Some(last) = st.last_pos {
                 let moved = Vec3::new(feet.x - last.x, 0.0, feet.z - last.z).length();
@@ -123,6 +134,17 @@ pub fn drive(
         }
     }
     st.last_pos = Some(feet);
+
+    // Empty-handed with an enemy close by: dash into them for a tackle.
+    if let Some(e) = enemy.filter(|_| !me.holding) {
+        let to = Vec3::new(e.x - feet.x, 0.0, e.z - feet.z);
+        if to.length() < 4.5 && st.dash_timer <= 2.0 {
+            intent.dir = to.normalize_or_zero();
+            intent.dash = true;
+            st.dash_timer = 5.0;
+            info!("autopilot: tackle dash");
+        }
+    }
 
     // Every few seconds: double-jump flip, or jump + Q/E spin, alternating.
     st.trick_timer -= dt;

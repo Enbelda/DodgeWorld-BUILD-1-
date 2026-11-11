@@ -160,12 +160,14 @@ fn host_controls(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tick_session(
     time: Res<Time>,
     mut session: ResMut<Session>,
     mut view: ResMut<View>,
     mut actions: ResMut<LocalActions>,
     trick: Res<LocalTrick>,
+    dash: Res<crate::player::LocalDash>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
@@ -179,6 +181,7 @@ fn tick_session(
             let local = host.local;
             host.sim.set_pose(local, feet, yaw);
             host.sim.set_trick(local, trick.0);
+            host.sim.set_dash(local, dash.report());
             for a in actions.0.drain(..) {
                 host.sim.apply(local, a);
             }
@@ -217,7 +220,7 @@ fn tick_session(
             for a in actions.0.drain(..) {
                 net.push_action(a);
             }
-            net.send_update(feet, yaw, trick.0, now);
+            net.send_update(feet, yaw, trick.0, dash.report(), now);
             if net.receive(now) {
                 if let Some(s) = net.latest.as_mut() {
                     new_events = std::mem::take(&mut s.events);
@@ -241,9 +244,14 @@ fn tick_session(
             GameEvent::Knockout { thrower, target } => {
                 format!("{} KNOCKED OUT {}", view.name_of(thrower), view.name_of(target))
             }
-            GameEvent::Caught { catcher, thrower } => {
-                format!("{} caught {}'s throw!", view.name_of(catcher), view.name_of(thrower))
+            GameEvent::Caught { catcher, thrower, perfect } => {
+                let how = if perfect { "PERFECT-caught" } else { "caught" };
+                format!("{} {how} {}'s throw!", view.name_of(catcher), view.name_of(thrower))
             }
+            GameEvent::Tackled { by, target } => {
+                format!("{} TACKLED {}!", view.name_of(by), view.name_of(target))
+            }
+            GameEvent::KnockedBack { target } => format!("{} got knocked back by a ricochet", view.name_of(target)),
             GameEvent::Slimed { thrower, target } => {
                 format!("{} got SLIMED by {}!", view.name_of(target), view.name_of(thrower))
             }

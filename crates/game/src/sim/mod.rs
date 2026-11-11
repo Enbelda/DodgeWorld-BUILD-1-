@@ -37,6 +37,19 @@ pub const SLIME_SECS: f32 = 3.0;
 pub const SLIME_KNOCK_SPEED: f32 = 18.0;
 /// Lock-on only works on enemies within this range.
 pub const LOCK_RANGE: f32 = 40.0;
+/// A catch pressed this close before the ball arrives is a perfect catch.
+pub const PERFECT_SECS: f32 = 0.15;
+/// Tackle: how close a dashing player must get, and how hard the target is launched.
+pub const TACKLE_RANGE: f32 = 1.2;
+pub const TACKLE_PUSH: f32 = 9.0;
+pub const TACKLE_LIFT: f32 = 8.0;
+/// Knockback from a ricocheting ball.
+pub const RICOCHET_PUSH: f32 = 10.0;
+pub const RICOCHET_LIFT: f32 = 5.0;
+/// Gravity on players launched by a tackle or ricochet.
+pub const KNOCK_GRAVITY: f32 = 22.0;
+/// Curved throws track an enemy within this cone of the aim (radians).
+const TRACK_CONE: f32 = 0.7;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Team {
@@ -135,6 +148,13 @@ pub struct Player {
     /// Enemy this player is locked on to; their throws home in on it.
     pub lock: Option<PlayerId>,
     pub slime: Option<Slime>,
+    /// Launched by a tackle or ricochet: the host flies them with this velocity until they land.
+    pub knock: Option<Vec3>,
+    /// The client is mid-dash (invincible, tackles on contact). `dash_seq` numbers dashes.
+    pub dashing: bool,
+    pub dash_seq: u32,
+    /// Who this dash already tackled.
+    pub tackled: Vec<PlayerId>,
     /// > 0 while knocked flat by a brick: no moving, throwing or catching.
     pub stun: f32,
     pub trick: Option<TrickState>,
@@ -162,6 +182,10 @@ impl Player {
     pub fn catching(&self) -> bool {
         self.catch_window > 0.0
     }
+    /// Stunned, slimed or flying from a knock: no moving, throwing, catching or turning.
+    pub fn helpless(&self) -> bool {
+        self.stun > 0.0 || self.slime.is_some() || self.knock.is_some()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -170,10 +194,21 @@ pub enum BallState {
     Free,
     Held { by: PlayerId },
     /// Thrown and dangerous to `team` enemies until it touches something.
-    /// `homing` is the locked-on target the ball steers toward.
-    Live { thrower: PlayerId, team: Team, curve: f32, lob: bool, powered: bool, homing: Option<PlayerId> },
+    /// `homing` is the locked-on target the ball steers toward; `track` is who a curved ball
+    /// goes around cover to reach.
+    Live {
+        thrower: PlayerId,
+        team: Team,
+        curve: f32,
+        lob: bool,
+        powered: bool,
+        homing: Option<PlayerId>,
+        track: Option<PlayerId>,
+    },
     /// A boomerang flying back to its thrower. Harmless; arrives charged.
     Returning { owner: PlayerId },
+    /// Bounced off a wall at double speed: knocks back whoever it hits, no damage.
+    Ricochet { thrower: PlayerId },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -183,11 +218,21 @@ pub struct Ball {
     pub state: BallState,
     pub pad: Vec3,
     pub kind: BallKind,
+    /// Perfect catches in a row (speed stacks), reset when the rally ends.
+    pub stacks: u8,
+    /// A curved ball has started going around cover (it keeps tracking after).
+    pub wrapping: bool,
 }
 
 impl Ball {
     pub fn new(pad: Vec3, kind: BallKind) -> Self {
-        Ball { pos: pad, vel: Vec3::ZERO, state: BallState::Free, pad, kind }
+        Ball { pos: pad, vel: Vec3::ZERO, state: BallState::Free, pad, kind, stacks: 0, wrapping: false }
+    }
+    /// The ball stops being part of a rally.
+    fn go_free(&mut self) {
+        self.state = BallState::Free;
+        self.stacks = 0;
+        self.wrapping = false;
     }
 }
 
@@ -196,7 +241,9 @@ impl Ball {
 pub enum GameEvent {
     Hit { thrower: PlayerId, target: PlayerId },
     Knockout { thrower: PlayerId, target: PlayerId },
-    Caught { catcher: PlayerId, thrower: PlayerId },
+    Caught { catcher: PlayerId, thrower: PlayerId, perfect: bool },
+    Tackled { by: PlayerId, target: PlayerId },
+    KnockedBack { target: PlayerId },
     Slimed { thrower: PlayerId, target: PlayerId },
     Stunned { thrower: PlayerId, target: PlayerId },
     BoomerangBack { owner: PlayerId },
@@ -205,6 +252,8 @@ pub enum GameEvent {
 }
 
 pub struct Match {
+    /// Cover blocks only (curved balls go around these).
+    pub cover: Vec<Aabb>,
     pub phase: Phase,
     pub mode: GameMode,
     pub map: MapId,
@@ -233,6 +282,7 @@ impl Match {
             balls: Vec::new(),
             score: [0, 0],
             solids: layout::solids(),
+            cover: layout::cover(),
             events: Vec::new(),
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             next_id: 0,
@@ -282,6 +332,10 @@ impl Match {
             throw_cooldown: 0.0,
             lock: None,
             slime: None,
+            knock: None,
+            dashing: false,
+            dash_seq: 0,
+            tackled: Vec::new(),
             stun: 0.0,
             trick: None,
             hits: 0,
@@ -329,11 +383,9 @@ impl Match {
     /// While slimed or stunned the host owns the position; only the facing is taken.
     pub fn set_pose(&mut self, id: PlayerId, pos: Vec3, yaw: f32) {
         if let Some(p) = self.player_mut(id) {
-            if p.alive() && pos.is_finite() && yaw.is_finite() {
-                if p.stun <= 0.0 {
-                    p.yaw = yaw;
-                }
-                if p.slime.is_none() && p.stun <= 0.0 {
+            if p.alive() && pos.is_finite() && yaw.is_finite() && !p.helpless() {
+                p.yaw = yaw;
+                {
                     let lim = ARENA_HALF + 2.0;
                     p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
                 }
@@ -348,6 +400,20 @@ impl Match {
                 kind: t.kind,
                 progress: t.progress.clamp(0.0, 1.0),
             });
+        }
+    }
+
+    /// A client reports whether it is mid-dash (`Some(dash number)`) or not.
+    pub fn set_dash(&mut self, id: PlayerId, dash: Option<u32>) {
+        if let Some(p) = self.player_mut(id) {
+            let dashing = dash.is_some() && p.alive() && !p.helpless();
+            if let Some(seq) = dash {
+                if seq != p.dash_seq {
+                    p.dash_seq = seq;
+                    p.tackled.clear();
+                }
+            }
+            p.dashing = dashing;
         }
     }
 
@@ -460,6 +526,8 @@ impl Match {
         p.catch_window = 0.0;
         p.catch_cooldown = 0.0;
         p.slime = None;
+        p.knock = None;
+        p.dashing = false;
         p.stun = 0.0;
         p.trick = None;
         p.lock = None;
@@ -473,8 +541,8 @@ impl Match {
         if !p.alive() || matches!(self.phase, Phase::Ended { .. }) {
             return;
         }
-        // Knocked flat: can't do anything but wait (letting go of a lock is fine).
-        if p.stun > 0.0 && !matches!(action, Action::Lock { target: None }) {
+        // Stunned, slimed or launched: can't do anything but wait (letting go of a lock is fine).
+        if p.helpless() && !matches!(action, Action::Lock { target: None }) {
             return;
         }
         match action {
@@ -498,23 +566,50 @@ impl Match {
                 let (powered, charged) = (p.powered, p.charged);
                 let charge = if charged { 1.0 } else { charge };
                 let params = ThrowParams { charge, curve, lob, powered: powered || charged };
-                let (vel, curve) = ball::launch(aim, params);
+                let (mut vel, curve) = ball::launch(aim, params);
                 p.holding = None;
                 p.powered = false;
                 p.charged = false;
                 p.throw_cooldown = THROW_COOLDOWN;
                 let (team, origin, lock) = (p.team, p.hold_point(), p.lock);
                 let homing = lock.filter(|t| self.valid_lock(team, *t));
+                // Who the throw is "at": the lock, else the enemy closest to the aim.
+                let aimed_at = homing.or_else(|| self.enemy_near_aim(team, origin, aim));
+                if lob {
+                    // Lobs drop onto the very top of the target's head.
+                    if let Some(t) = aimed_at.and_then(|t| self.player(t)) {
+                        vel = ball::lob_to(origin, t.pos + Vec3::Y * (BODY_HEIGHT + 0.1));
+                    }
+                } else {
+                    vel = (vel * ball::stack_multiplier(self.balls[bi].stacks)).clamp_length_max(ball::MAX_BALL_SPEED);
+                }
+                let track = if curve != 0.0 { aimed_at } else { None };
                 let b = &mut self.balls[bi];
                 b.pos = origin;
                 b.vel = vel;
-                b.state = BallState::Live { thrower: id, team, curve, lob, powered, homing };
+                b.wrapping = false;
+                b.state = BallState::Live { thrower: id, team, curve, lob, powered, homing, track };
             }
             Action::Lock { target } => {
                 let team = self.players[pi].team;
                 self.players[pi].lock = target.filter(|t| self.valid_lock(team, *t));
             }
         }
+    }
+
+    /// The living enemy of `team` closest to the aim direction, within a cone and range.
+    fn enemy_near_aim(&self, team: Team, from: Vec3, aim: Vec3) -> Option<PlayerId> {
+        let aim = Vec3::new(aim.x, 0.0, aim.z).normalize_or_zero();
+        self.players
+            .iter()
+            .filter(|p| p.team != team && p.alive())
+            .filter_map(|p| {
+                let to = Vec3::new(p.pos.x - from.x, 0.0, p.pos.z - from.z);
+                let angle = aim.angle_between(to.normalize_or_zero());
+                (to.length() <= LOCK_RANGE && angle <= TRACK_CONE).then_some((angle, p.id))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, id)| id)
     }
 
     /// Can someone on `team` lock on to `target`? It must be a living enemy.
@@ -524,6 +619,7 @@ impl Match {
 
     pub fn step(&mut self, dt: f32) {
         self.tick_players(dt);
+        self.tackles();
         self.run_bots(dt);
         self.step_balls(dt);
         self.pickups();
@@ -539,8 +635,18 @@ impl Match {
         }
         let respawns = self.respawns_enabled();
         let mut to_respawn = Vec::new();
+        let solids = &self.solids;
         for p in &mut self.players {
             p.stun = (p.stun - dt).max(0.0);
+            if let Some(v) = p.knock.as_mut() {
+                v.y -= KNOCK_GRAVITY * dt;
+                p.pos += *v * dt;
+                p.pos = bot::collide_feet(Vec3::new(p.pos.x, p.pos.y, p.pos.z), solids).with_y(p.pos.y);
+                if p.pos.y <= 0.0 && v.y < 0.0 {
+                    p.pos.y = 0.0;
+                    p.knock = None;
+                }
+            }
             if let Some(sl) = p.slime.as_mut() {
                 let to = Vec3::new(sl.anchor.x - p.pos.x, 0.0, sl.anchor.z - p.pos.z);
                 let step = SLIME_KNOCK_SPEED * dt;
@@ -576,9 +682,58 @@ impl Match {
         }
     }
 
+    /// Dashing into an enemy launches them (and any ball they hold) into the air.
+    fn tackles(&mut self) {
+        let dashers: Vec<(usize, Vec3, Vec3, Team)> = self
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.dashing && p.alive())
+            .map(|(i, p)| (i, p.pos, p.forward(), p.team))
+            .collect();
+        for (di, dpos, dfwd, dteam) in dashers {
+            let victims: Vec<usize> = self
+                .players
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.team != dteam && e.alive() && e.knock.is_none() && !e.dashing)
+                .filter(|(_, e)| !self.players[di].tackled.contains(&e.id))
+                .filter(|(_, e)| {
+                    let flat = Vec3::new(e.pos.x - dpos.x, 0.0, e.pos.z - dpos.z).length();
+                    flat < TACKLE_RANGE && (e.pos.y - dpos.y).abs() < 1.6
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for vi in victims {
+                let (by, target) = (self.players[di].id, self.players[vi].id);
+                self.players[di].tackled.push(target);
+                let push = Vec3::new(self.players[vi].pos.x - dpos.x, 0.0, self.players[vi].pos.z - dpos.z)
+                    .normalize_or(dfwd);
+                self.launch(vi, push * TACKLE_PUSH + Vec3::Y * TACKLE_LIFT);
+                self.events.push(GameEvent::Tackled { by, target });
+            }
+        }
+    }
+
+    /// Throw a player through the air (host-owned until they land); their ball pops up too.
+    fn launch(&mut self, pi: usize, vel: Vec3) {
+        let p = &mut self.players[pi];
+        p.knock = Some(vel);
+        p.catch_window = 0.0;
+        p.trick = None;
+        p.dashing = false;
+        if let Some(held) = p.holding.take() {
+            p.powered = false;
+            p.charged = false;
+            let b = &mut self.balls[held];
+            b.go_free();
+            b.vel = Vec3::Y * 10.0 + Vec3::new(vel.x, 0.0, vel.z) * 0.2;
+        }
+    }
+
     fn run_bots(&mut self, dt: f32) {
         let ids: Vec<PlayerId> =
-            self.players.iter().filter(|p| p.bot && p.alive() && p.stun <= 0.0).map(|p| p.id).collect();
+            self.players.iter().filter(|p| p.bot && p.alive() && !p.helpless()).map(|p| p.id).collect();
         for id in ids {
             let actions = bot::think(self, id, dt);
             for a in actions {
@@ -599,7 +754,7 @@ impl Match {
                             b.pos = at;
                             b.vel = Vec3::ZERO;
                         }
-                        None => self.balls[bi].state = BallState::Free,
+                        None => self.balls[bi].go_free(),
                     }
                 }
                 BallState::Free => {
@@ -609,39 +764,74 @@ impl Match {
                         ball::step(&mut b.pos, &mut b.vel, 0.0, g, dt, &self.solids);
                     }
                 }
-                BallState::Live { thrower, team, curve, lob, powered, homing } => {
+                BallState::Live { thrower, team, curve, lob, powered, homing, track } => {
                     let g = ball::gravity(lob, true);
-                    let aim_at =
-                        homing.and_then(|t| self.player(t)).filter(|t| t.alive()).map(|t| t.pos + Vec3::Y * 1.0);
+                    let chest_of = |id: Option<PlayerId>| {
+                        id.and_then(|t| self.player(t)).filter(|t| t.alive()).map(|t| t.pos + Vec3::Y * 1.0)
+                    };
+                    let (aim_at, track_at) = (chest_of(homing), chest_of(track));
                     let b = &mut self.balls[bi];
                     if let Some(target) = aim_at {
                         ball::home(&mut b.vel, target - b.pos, dt, lob);
                     }
+                    // A curved throw at someone behind cover swings around it, then tracks them.
+                    let mut bend = curve;
+                    if let Some(target) = track_at {
+                        let side = -curve.signum();
+                        if let Some(wp) = ball::wrap_waypoint(b.pos, target, side, &self.cover) {
+                            b.wrapping = true;
+                            ball::steer_flat(&mut b.vel, wp - b.pos, ball::WRAP_TURN_RATE, dt);
+                            bend = 0.0;
+                        } else if b.wrapping {
+                            ball::turn_toward(&mut b.vel, target - b.pos, ball::TRACK_TURN_RATE, dt, false);
+                            bend = 0.0;
+                        }
+                    }
                     let prev = b.pos;
-                    let r = ball::step(&mut b.pos, &mut b.vel, curve, g, dt, &self.solids);
+                    let r = ball::step(&mut b.pos, &mut b.vel, bend, g, dt, &self.solids);
                     let now = b.pos;
                     if let Some(target) = self.first_enemy_hit(team, prev, now) {
                         self.resolve_hit(bi, thrower, target, powered);
                     } else if r.touched {
                         let b = &mut self.balls[bi];
-                        b.state = match b.kind {
-                            BallKind::Boomerang => BallState::Returning { owner: thrower },
-                            _ => BallState::Free,
-                        };
+                        match (b.kind, r.wall) {
+                            (BallKind::Boomerang, _) => {
+                                b.state = BallState::Returning { owner: thrower };
+                                b.stacks = 0;
+                            }
+                            // Off a wall: double speed, harmless knockback ball.
+                            (_, Some(n)) => {
+                                b.vel = ball::ricochet(r.vel_before_wall, n);
+                                b.state = BallState::Ricochet { thrower };
+                                b.stacks = 0;
+                            }
+                            _ => b.go_free(),
+                        }
+                    }
+                }
+                BallState::Ricochet { thrower } => {
+                    let b = &mut self.balls[bi];
+                    let prev = b.pos;
+                    let r = ball::step(&mut b.pos, &mut b.vel, 0.0, ball::THROW_GRAVITY, dt, &self.solids);
+                    let now = b.pos;
+                    if let Some(pi) = self.first_player_hit(prev, now) {
+                        self.ricochet_hit(bi, pi, thrower);
+                    } else if r.touched {
+                        self.balls[bi].go_free();
                     }
                 }
                 BallState::Returning { owner } => {
                     let home =
                         self.player(owner).filter(|p| p.alive()).map(|p| (p.hold_point(), p.holding.is_some()));
                     let Some((at, hands_full)) = home else {
-                        self.balls[bi].state = BallState::Free;
+                        self.balls[bi].go_free();
                         continue;
                     };
                     let b = &mut self.balls[bi];
                     if ball::fly_back(&mut b.pos, &mut b.vel, at, dt) {
                         if hands_full {
                             // Owner grabbed another ball meanwhile: drop it at their feet.
-                            b.state = BallState::Free;
+                            b.go_free();
                         } else {
                             b.state = BallState::Held { by: owner };
                             if let Some(p) = self.player_mut(owner) {
@@ -665,16 +855,67 @@ impl Match {
                 let b = &mut self.balls[bi];
                 b.pos = b.pad;
                 b.vel = Vec3::ZERO;
-                b.state = BallState::Free;
+                b.go_free();
             }
         }
+    }
+
+    /// Any living, non-dashing player the path a->b crosses first (ricochets hit anyone).
+    fn first_player_hit(&self, a: Vec3, b: Vec3) -> Option<usize> {
+        self.players
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.alive() && !p.dashing)
+            .filter_map(|(i, p)| segment_hits_body(a, b, p.pos).map(|t| (t, i)))
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+            .map(|(_, i)| i)
+    }
+
+    /// A ricochet hits someone: caught if they are catching and facing it, otherwise
+    /// they are knocked back with no damage and no points.
+    fn ricochet_hit(&mut self, bi: usize, pi: usize, thrower: PlayerId) {
+        let vel = self.balls[bi].vel;
+        let p = &self.players[pi];
+        let facing = Vec3::new(-vel.x, 0.0, -vel.z).normalize_or_zero().dot(p.forward());
+        if p.catching() && p.holding.is_none() && facing > CATCH_FACING {
+            self.catch_ball(bi, pi, thrower);
+            return;
+        }
+        let push = Vec3::new(vel.x, 0.0, vel.z).normalize_or_zero();
+        let target = self.players[pi].id;
+        self.players[pi].hits = self.players[pi].hits.wrapping_add(1);
+        if !self.players[pi].catching() {
+            self.launch(pi, push * RICOCHET_PUSH + Vec3::Y * RICOCHET_LIFT);
+        }
+        let b = &mut self.balls[bi];
+        b.go_free();
+        b.vel = Vec3::new(-vel.x * 0.1, 3.0, -vel.z * 0.1);
+        self.events.push(GameEvent::KnockedBack { target });
+    }
+
+    /// `pi` catches ball `bi`. Pressed just before it arrived: a perfect catch.
+    fn catch_ball(&mut self, bi: usize, pi: usize, thrower: PlayerId) {
+        let t = &mut self.players[pi];
+        let perfect = CATCH_WINDOW - t.catch_window <= PERFECT_SECS;
+        t.holding = Some(bi);
+        t.powered = true;
+        t.charged = perfect;
+        t.catch_window = 0.0;
+        t.catch_cooldown = 0.0;
+        let catcher = t.id;
+        let b = &mut self.balls[bi];
+        b.state = BallState::Held { by: catcher };
+        b.wrapping = false;
+        b.stacks = if perfect { (b.stacks + 1).min(ball::MAX_STACKS) } else { 0 };
+        self.events.push(GameEvent::Caught { catcher, thrower, perfect });
     }
 
     /// The enemy (of `team`) whose body the ball's path from `a` to `b` crosses first.
     fn first_enemy_hit(&self, team: Team, a: Vec3, b: Vec3) -> Option<PlayerId> {
         self.players
             .iter()
-            .filter(|p| p.team != team && p.alive())
+            // Dashing players are invincible: balls pass through them.
+            .filter(|p| p.team != team && p.alive() && !p.dashing)
             .filter_map(|p| segment_hits_body(a, b, p.pos).map(|t| (t, p.id)))
             .min_by(|x, y| x.0.total_cmp(&y.0))
             .map(|(_, id)| id)
@@ -687,24 +928,24 @@ impl Match {
         let incoming = (-ball_vel).normalize_or_zero();
         let facing = Vec3::new(incoming.x, 0.0, incoming.z).normalize_or_zero().dot(t.forward());
         if t.catching() && t.holding.is_none() && facing > CATCH_FACING {
-            let t = &mut self.players[ti];
-            t.holding = Some(bi);
-            t.powered = true;
-            t.catch_window = 0.0;
-            t.catch_cooldown = 0.0;
-            self.balls[bi].state = BallState::Held { by: target };
-            self.events.push(GameEvent::Caught { catcher: target, thrower });
+            self.catch_ball(bi, ti, thrower);
             return;
         }
 
         // Hit: a boomerang heads home, anything else drops dead and bounces off.
         let b = &mut self.balls[bi];
         let kind = b.kind;
+        b.stacks = 0;
+        b.wrapping = false;
         b.state = match kind {
             BallKind::Boomerang => BallState::Returning { owner: thrower },
             _ => BallState::Free,
         };
         b.vel = Vec3::new(-ball_vel.x * 0.15, 3.0, -ball_vel.z * 0.15);
+        // Mid-catch, nothing hurts: the ball just bounces off.
+        if t.catching() {
+            return;
+        }
 
         let dmg = kind.damage(powered);
         let t = &mut self.players[ti];
@@ -722,7 +963,7 @@ impl Match {
                 if let Some(held) = t.holding.take() {
                     t.powered = false;
                     t.charged = false;
-                    self.balls[held].state = BallState::Free;
+                    self.balls[held].go_free();
                     self.balls[held].vel = Vec3::Y * 2.0;
                 }
                 self.events.push(GameEvent::Stunned { thrower, target });
@@ -737,6 +978,7 @@ impl Match {
         t.respawn_timer = RESPAWN_SECS;
         t.catch_window = 0.0;
         t.slime = None;
+        t.knock = None;
         t.stun = 0.0;
         t.trick = None;
         let counts = self.phase == Phase::Playing;
@@ -745,7 +987,7 @@ impl Match {
         }
         let victim_team = t.team;
         if let Some(held) = t.holding.take() {
-            self.balls[held].state = BallState::Free;
+            self.balls[held].go_free();
             self.balls[held].vel = Vec3::Y * 2.0;
         }
         t.powered = false;
@@ -781,6 +1023,7 @@ impl Match {
                 self.players[pi].powered = false;
                 self.players[pi].charged = false;
                 self.balls[bi].state = BallState::Held { by: id };
+                self.balls[bi].stacks = 0;
             }
         }
     }
@@ -809,6 +1052,8 @@ impl Match {
                     lock: p.lock,
                     slimed: p.slime.map_or(0.0, |s| s.timer),
                     stunned: p.stun,
+                    knocked: p.knock.is_some(),
+                    dashing: p.dashing,
                     trick: p.trick,
                     hits: p.hits,
                     catch_cooldown: p.catch_cooldown,
@@ -822,7 +1067,13 @@ impl Match {
             balls: self
                 .balls
                 .iter()
-                .map(|b| BallView { pos: b.pos.to_array(), vel: b.vel.to_array(), state: b.state, kind: b.kind })
+                .map(|b| BallView {
+                    pos: b.pos.to_array(),
+                    vel: b.vel.to_array(),
+                    state: b.state,
+                    kind: b.kind,
+                    stacks: b.stacks,
+                })
                 .collect(),
             events: self.events.clone(),
         }
@@ -874,6 +1125,10 @@ pub struct PlayerView {
     pub slimed: f32,
     /// Seconds left knocked flat by a brick (0 = up).
     pub stunned: f32,
+    /// Flying from a tackle or ricochet (the host moves them).
+    pub knocked: bool,
+    /// Mid-dash: invincible, shown glowing blue.
+    pub dashing: bool,
     pub trick: Option<TrickState>,
     pub hits: u32,
     pub respawn_timer: f32,
@@ -896,6 +1151,7 @@ pub struct BallView {
     pub vel: [f32; 3],
     pub state: BallState,
     pub kind: BallKind,
+    pub stacks: u8,
 }
 
 /// Small deterministic RNG (xorshift64) so the sim has no extra dependencies.
@@ -1019,17 +1275,7 @@ mod tests {
         assert_eq!(b.hp, MAX_HP);
         assert_eq!(b.holding, Some(0));
         assert!(b.powered, "caught ball is powered");
-        assert!(m.events.contains(&GameEvent::Caught { catcher: blue, thrower: red }));
-    }
-
-    #[test]
-    fn no_catch_from_behind() {
-        let (mut m, red, blue) = duel();
-        m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), 0.0); // facing away from red
-        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
-        m.apply(blue, Action::Catch);
-        run(&mut m, 0.5);
-        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1);
+        assert!(m.events.iter().any(|e| matches!(e, GameEvent::Caught { catcher, thrower, .. } if *catcher == blue && *thrower == red)));
     }
 
     #[test]
@@ -1351,6 +1597,208 @@ mod tests {
         assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Brick).count(), 1);
         assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Boomerang).count(), 1);
         assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Slime).count(), 1);
+    }
+
+    /// Move the sim until ball 0 is about `secs` from reaching `target`'s chest.
+    fn run_until_eta(m: &mut Match, target: PlayerId, secs: f32) {
+        for _ in 0..120 {
+            let chest = m.player(target).unwrap().pos + Vec3::Y * 1.1;
+            let b = m.balls[0];
+            if b.pos.distance(chest) - BODY_RADIUS <= b.vel.length() * secs {
+                return;
+            }
+            m.step(DT);
+        }
+        panic!("ball never got close");
+    }
+
+    #[test]
+    fn lob_drops_onto_the_head() {
+        let (mut m, red, blue) = duel();
+        m.apply(red, Action::Throw { aim: [0.0, 0.0, -1.0], charge: 0.0, curve: 0.0, lob: true });
+        run(&mut m, 2.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "the lob came down on blue");
+    }
+
+    #[test]
+    fn catching_blocks_damage_even_from_behind() {
+        let (mut m, red, blue) = duel();
+        m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), 0.0); // back to the thrower
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run_until_eta(&mut m, blue, 0.2);
+        m.apply(blue, Action::Catch);
+        run(&mut m, 0.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP, "no damage while catching");
+        assert!(
+            !m.events.iter().any(|e| matches!(e, GameEvent::Caught { .. })),
+            "can't catch what you don't face"
+        );
+    }
+
+    #[test]
+    fn slimed_player_can_do_nothing() {
+        let (mut m, red, blue) = duel();
+        m.players.iter_mut().find(|p| p.id == red).unwrap().slime = Some(Slime { anchor: LANE, timer: 2.0 });
+        let yaw = m.player(red).unwrap().yaw;
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        assert_eq!(m.player(red).unwrap().holding, Some(0), "can't throw");
+        m.apply(red, Action::Catch);
+        assert_eq!(m.player(red).unwrap().catch_window, 0.0, "can't catch");
+        m.set_pose(red, LANE, yaw + 1.0);
+        assert_eq!(m.player(red).unwrap().yaw, yaw, "can't even turn");
+        let _ = blue;
+    }
+
+    #[test]
+    fn perfect_catch_charges_and_stacks_speed() {
+        let (mut m, red, blue) = duel();
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run_until_eta(&mut m, blue, 0.08);
+        m.apply(blue, Action::Catch);
+        run(&mut m, 0.3);
+        let b = m.player(blue).unwrap();
+        assert_eq!(b.holding, Some(0));
+        assert!(b.charged, "perfect catch keeps it fully charged");
+        assert_eq!(m.balls[0].stacks, 1);
+        assert!(m.events.iter().any(|e| matches!(e, GameEvent::Caught { perfect: true, .. })));
+        // Thrown back: full charge + bonus, then doubled by the stack.
+        m.apply(blue, Action::Throw { aim: [0.0, -0.05, 1.0], charge: 0.0, curve: 0.0, lob: false });
+        let speed = m.balls[0].vel.length();
+        let base = ball::MAX_THROW_SPEED + ball::POWER_BONUS;
+        assert!((speed - base * 2.0).abs() < 1.0, "speed {speed}");
+    }
+
+    #[test]
+    fn early_catch_is_not_perfect() {
+        let (mut m, red, blue) = duel();
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run_until_eta(&mut m, blue, 0.3);
+        m.apply(blue, Action::Catch);
+        run(&mut m, 0.4);
+        assert_eq!(m.player(blue).unwrap().holding, Some(0));
+        assert!(!m.player(blue).unwrap().charged);
+        assert_eq!(m.balls[0].stacks, 0);
+    }
+
+    #[test]
+    fn stacks_cap_at_four() {
+        let (mut m, red, blue) = duel();
+        m.balls[0].stacks = ball::MAX_STACKS;
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run_until_eta(&mut m, blue, 0.08);
+        m.apply(blue, Action::Catch);
+        run(&mut m, 0.2);
+        assert_eq!(m.balls[0].stacks, ball::MAX_STACKS);
+    }
+
+    #[test]
+    fn wall_ricochet_knocks_back_without_damage() {
+        let (mut m, red, _blue) = duel();
+        // Red throws at the +X arena wall 6 m away; it comes back twice as fast at red.
+        throw_at(&mut m, red, Vec3::new(1.0, -0.02, 0.0));
+        let thrown = m.balls[0].vel.length();
+        let mut saw = None;
+        for _ in 0..60 {
+            m.step(DT);
+            if matches!(m.balls[0].state, BallState::Ricochet { .. }) && saw.is_none() {
+                saw = Some(m.balls[0].vel.length());
+            }
+        }
+        let back = saw.expect("ricocheted");
+        assert!(back > thrown * 1.7, "about double speed: {thrown} -> {back}");
+        let r = m.player(red).unwrap();
+        assert_eq!(r.hp, MAX_HP, "no damage");
+        assert!(m.events.contains(&GameEvent::KnockedBack { target: red }));
+        assert_eq!(m.score, [0, 0], "no points");
+    }
+
+    #[test]
+    fn knocked_player_flies_then_lands() {
+        let (mut m, red, _) = duel();
+        let i = m.players.iter().position(|p| p.id == red).unwrap();
+        m.launch(i, Vec3::new(5.0, 6.0, 0.0));
+        let start = m.player(red).unwrap().pos;
+        assert!(m.player(red).unwrap().holding.is_none(), "dropped the ball");
+        run(&mut m, 0.2);
+        assert!(m.player(red).unwrap().pos.y > 0.5, "in the air");
+        run(&mut m, 1.5);
+        let r = m.player(red).unwrap();
+        assert!(r.knock.is_none() && r.pos.y == 0.0);
+        assert!(r.pos.x > start.x + 2.0, "pushed along");
+    }
+
+    #[test]
+    fn dash_tackle_launches_enemy_and_their_ball_once() {
+        let (mut m, red, blue) = duel();
+        // Give blue the ball, put red right next to them, mid-dash.
+        m.players.iter_mut().find(|p| p.id == red).unwrap().holding = None;
+        m.balls[0].state = BallState::Held { by: blue };
+        m.players.iter_mut().find(|p| p.id == blue).unwrap().holding = Some(0);
+        let bpos = m.player(blue).unwrap().pos;
+        m.set_pose(red, bpos + Vec3::new(0.0, 0.0, 0.8), 0.0);
+        m.set_dash(red, Some(7));
+        m.step(DT);
+        let b = m.player(blue).unwrap();
+        assert!(b.knock.is_some(), "launched");
+        assert!(b.holding.is_none());
+        assert!(m.balls[0].vel.y > 5.0, "ball pops up");
+        assert!(m.events.contains(&GameEvent::Tackled { by: red, target: blue }));
+        // Same dash can't tackle them again after they land.
+        run(&mut m, 2.0);
+        m.set_pose(blue, bpos, 0.0);
+        m.set_pose(red, bpos + Vec3::new(0.0, 0.0, 0.8), 0.0);
+        m.set_dash(red, Some(7));
+        m.step(DT);
+        assert!(m.player(blue).unwrap().knock.is_none());
+    }
+
+    #[test]
+    fn teammates_are_not_tackled() {
+        let mut m = Match::new();
+        let a = m.add_player("a", false).unwrap();
+        m.add_player("enemy", true).unwrap();
+        let c = m.add_player("c", false).unwrap();
+        m.players.retain(|p| !p.bot);
+        m.set_pose(a, LANE, 0.0);
+        m.set_pose(c, LANE + Vec3::Z * 0.8, 0.0);
+        m.set_dash(c, Some(1));
+        m.step(DT);
+        assert!(m.player(a).unwrap().knock.is_none());
+    }
+
+    #[test]
+    fn dashing_is_invincible() {
+        let (mut m, red, blue) = duel();
+        m.set_dash(blue, Some(1));
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP);
+    }
+
+    /// Red at z=+8 behind... blue hiding behind the x=9 pillar (x 8..10, z -1..1).
+    fn hide_and_seek() -> (Match, PlayerId, PlayerId) {
+        let (mut m, red, blue) = duel();
+        m.set_pose(red, Vec3::new(9.0, 0.0, 8.0), 0.0);
+        m.set_pose(blue, Vec3::new(9.0, 0.0, -6.0), 0.0);
+        m.step(DT);
+        (m, red, blue)
+    }
+
+    #[test]
+    fn curve_wraps_around_cover_to_hit_the_hider() {
+        let (mut m, red, blue) = hide_and_seek();
+        m.apply(red, Action::Throw { aim: [0.0, -0.02, -1.0], charge: 0.5, curve: 1.0, lob: false });
+        assert!(matches!(m.balls[0].state, BallState::Live { track: Some(t), .. } if t == blue));
+        run(&mut m, 1.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "went around the pillar");
+    }
+
+    #[test]
+    fn straight_throw_at_cover_does_not_hit_the_hider() {
+        let (mut m, red, blue) = hide_and_seek();
+        m.apply(red, Action::Throw { aim: [0.0, -0.02, -1.0], charge: 0.5, curve: 0.0, lob: false });
+        run(&mut m, 1.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP);
     }
 
     #[test]

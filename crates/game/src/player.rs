@@ -1,8 +1,9 @@
 //! The local player's body (Rapier character controller) and combat input.
 //!
-//! Controls: WASD move, Space jump (again in the air to double jump with a flip), hold Left
-//! Mouse to charge (auto-locks the nearest enemy) and release to throw, hold Q / E while
-//! throwing to curve, F to lob, Right Mouse to catch (time it), Tab or Middle Mouse to lock on.
+//! Controls: WASD move, Shift sprint, Ctrl dash (tackles), Space jump (again in the air to
+//! double jump with a flip), hold Left Mouse to charge (locks the nearest enemy while charging)
+//! and release to throw, hold Q / E while throwing to curve, F to lob, Right Mouse to catch
+//! (time it), Tab / Middle Mouse while charging to switch target.
 //! In the air: Q / E spin 180 left / right; W+Q/E front flip, S+Q/E back flip.
 
 use bevy::prelude::*;
@@ -16,6 +17,16 @@ use crate::sim::{
 };
 
 const MOVE_SPEED: f32 = 7.0;
+/// Shift: run this much faster.
+pub const SPRINT_MULT: f32 = 1.4;
+/// Jumping or dashing while sprinting goes this much farther.
+pub const SPRINT_JUMP_MULT: f32 = 1.24;
+/// Dash: distance, duration, charges and cooldowns.
+pub const DASH_DIST: f32 = 6.0;
+pub const DASH_SECS: f32 = 0.12;
+pub const DASH_CHARGES: u8 = 2;
+pub const DASH_GAP: f32 = 0.2;
+pub const DASH_RECHARGE: f32 = 1.5;
 const JUMP_SPEED: f32 = 8.0;
 const DOUBLE_JUMP_SPEED: f32 = 7.5;
 /// Extra jumps allowed in the air.
@@ -38,6 +49,8 @@ pub const FEET_OFFSET: f32 = BODY_HEIGHT / 2.0;
 pub struct LocalBody {
     pub vel_y: f32,
     pub air_jumps: u8,
+    /// Took off while sprinting: the jump carries farther.
+    pub sprint_jump: bool,
     /// Last host teleport counter we obeyed.
     pub teleports: Option<u32>,
 }
@@ -55,6 +68,63 @@ pub struct MoveIntent {
     pub jump: bool,
     /// Q (left) or E (right) pressed for an air trick.
     pub trick: Option<Side>,
+    /// Shift held.
+    pub sprint: bool,
+    /// Ctrl pressed.
+    pub dash: bool,
+}
+
+/// The local player's dashes: two charges, a short gap between them, and both come back
+/// `DASH_RECHARGE` seconds after the last dash.
+#[derive(Resource, Debug, Clone)]
+pub struct LocalDash {
+    pub charges: u8,
+    pub since_last: f32,
+    /// Seconds left in the current dash (0 = not dashing).
+    pub active: f32,
+    pub velocity: Vec3,
+    /// Numbers each dash so the host tackles each player once per dash.
+    pub seq: u32,
+}
+
+impl Default for LocalDash {
+    fn default() -> Self {
+        LocalDash { charges: DASH_CHARGES, since_last: DASH_RECHARGE, active: 0.0, velocity: Vec3::ZERO, seq: 0 }
+    }
+}
+
+impl LocalDash {
+    /// Start a dash in `dir` if a charge is ready. Sprinting dashes go farther.
+    pub fn try_start(&mut self, dir: Vec3, sprint: bool) -> bool {
+        if self.charges == 0 || self.since_last < DASH_GAP || self.active > 0.0 {
+            return false;
+        }
+        let dist = if sprint { DASH_DIST * SPRINT_JUMP_MULT } else { DASH_DIST };
+        let flat = Vec3::new(dir.x, 0.0, dir.z).normalize_or(Vec3::NEG_Z);
+        self.velocity = flat * (dist / DASH_SECS);
+        self.charges -= 1;
+        self.since_last = 0.0;
+        self.active = DASH_SECS;
+        self.seq = self.seq.wrapping_add(1);
+        true
+    }
+
+    pub fn tick(&mut self, dt: f32) {
+        self.active = (self.active - dt).max(0.0);
+        self.since_last += dt;
+        if self.since_last >= DASH_RECHARGE {
+            self.charges = DASH_CHARGES;
+        }
+    }
+
+    pub fn dashing(&self) -> bool {
+        self.active > 0.0
+    }
+
+    /// What the host needs: the dash number while mid-dash.
+    pub fn report(&self) -> Option<u32> {
+        self.dashing().then_some(self.seq)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,6 +155,7 @@ impl Plugin for PlayerPlugin {
             .init_resource::<MoveIntent>()
             .init_resource::<Autopilot>()
             .init_resource::<LockOn>()
+            .init_resource::<LocalDash>()
             .add_systems(Startup, spawn_local_body)
             .add_systems(
                 Update,
@@ -187,6 +258,19 @@ pub fn nearest_enemy(enemies: &[(PlayerId, Vec3)], from: Vec3) -> Option<PlayerI
         .map(|(_, id)| id)
 }
 
+/// Tab while charging: the next enemy after `current` (by closeness to the crosshair),
+/// wrapping around.
+pub fn next_target(enemies: &[(PlayerId, Vec3)], current: Option<PlayerId>, from: Vec3, forward: Vec3) -> Option<PlayerId> {
+    let mut by_angle: Vec<(f32, PlayerId)> =
+        enemies.iter().map(|&(id, pos)| (forward.angle_between(pos - from), id)).collect();
+    by_angle.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let ids: Vec<PlayerId> = by_angle.into_iter().map(|(_, id)| id).collect();
+    match current.and_then(|c| ids.iter().position(|&id| id == c)) {
+        Some(i) => ids.get((i + 1) % ids.len()).copied(),
+        None => ids.first().copied(),
+    }
+}
+
 /// The enemy nearest the crosshair: within `LOCK_RANGE` and `LOCK_CONE` of `forward`.
 pub fn pick_lock_target(enemies: &[(PlayerId, Vec3)], from: Vec3, forward: Vec3) -> Option<PlayerId> {
     enemies
@@ -230,6 +314,7 @@ fn lock_input(
     locked: Res<CursorLocked>,
     auto: Res<Autopilot>,
     view: Res<View>,
+    charge: Res<Charge>,
     mut lock: ResMut<LockOn>,
     mut actions: ResMut<LocalActions>,
     cam: Single<&Transform, With<FollowCamera>>,
@@ -247,14 +332,12 @@ fn lock_input(
             actions.0.push(Action::Lock { target: None });
         }
     }
+    // Tab / middle mouse while charging switches to another enemy.
     let pressed = keys.just_pressed(KeyCode::Tab) || mouse.just_pressed(MouseButton::Middle);
-    if auto.0 || !locked.0 || !pressed || !me.alive() {
+    if auto.0 || !locked.0 || !pressed || !me.alive() || charge.started.is_none() {
         return;
     }
-    let target = match lock.0 {
-        Some(_) => None,
-        None => pick_lock_target(&enemies, cam.translation, *cam.forward()),
-    };
+    let target = next_target(&enemies, lock.0, cam.translation, *cam.forward());
     if target != lock.0 {
         lock.0 = target;
         actions.0.push(Action::Lock { target });
@@ -296,6 +379,8 @@ fn keyboard_intent(
     }
     intent.dir = input_direction(&keys, cam.yaw);
     intent.jump = keys.just_pressed(KeyCode::Space);
+    intent.sprint = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    intent.dash = keys.just_pressed(KeyCode::ControlLeft) || keys.just_pressed(KeyCode::ControlRight);
     // While charging a throw, Q/E curve the ball instead of doing tricks.
     let charging = mouse.pressed(MouseButton::Left);
     intent.trick = match (keys.just_pressed(KeyCode::KeyQ), keys.just_pressed(KeyCode::KeyE)) {
@@ -311,6 +396,7 @@ pub fn move_local_body(
     intent: Res<MoveIntent>,
     view: Res<View>,
     mut trick: ResMut<LocalTrick>,
+    mut dash: ResMut<LocalDash>,
     mut cam: Single<&mut FollowCamera>,
     body: Single<(
         &mut LocalBody,
@@ -323,14 +409,17 @@ pub fn move_local_body(
     let (mut b, mut tf, mut controller, output) = body.into_inner();
     let me = view.me();
     tf.rotation = Quat::from_rotation_y(cam.yaw);
+    dash.tick(dt);
     if !me.is_none_or(|m| m.alive()) {
         controller.translation = None;
         trick.0 = None;
+        dash.active = 0.0;
         return;
     }
-    // Slimed or knocked flat: the host owns our position.
-    if let Some(m) = me.filter(|m| m.slimed > 0.0 || m.stunned > 0.0) {
+    // Slimed, knocked flat or launched: the host owns our position.
+    if let Some(m) = me.filter(|m| m.slimed > 0.0 || m.stunned > 0.0 || m.knocked) {
         trick.0 = None;
+        dash.active = 0.0;
         let target = Vec3::from_array(m.pos) + Vec3::Y * FEET_OFFSET;
         tf.translation = tf.translation.lerp(target, 1.0 - (-20.0 * dt).exp());
         controller.translation = None;
@@ -342,6 +431,20 @@ pub fn move_local_body(
     if grounded {
         b.vel_y = 0.0;
         b.air_jumps = AIR_JUMPS;
+        b.sprint_jump = false;
+    }
+    // Ctrl: a quick burst in the movement direction (or straight ahead), ground or air.
+    if intent.dash {
+        let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+        let dir = if intent.dir.length_squared() > 0.01 { intent.dir } else { fwd };
+        if dash.try_start(dir, intent.sprint) {
+            trick.0 = None;
+        }
+    }
+    if dash.dashing() {
+        b.vel_y = 0.0;
+        controller.translation = Some(dash.velocity * dt);
+        return;
     }
     let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
     let fwd_amount = intent.dir.normalize_or_zero().dot(forward);
@@ -349,6 +452,9 @@ pub fn move_local_body(
         if let Some((vy, left)) = try_jump(grounded, b.air_jumps) {
             b.vel_y = vy;
             b.air_jumps = left;
+            if grounded {
+                b.sprint_jump = intent.sprint;
+            }
             if !grounded {
                 // The second jump flips: forward or backward with the movement.
                 trick.0 = Some(TrickState { kind: double_jump_flip(fwd_amount), progress: 0.0 });
@@ -363,8 +469,18 @@ pub fn move_local_body(
     advance_trick(&mut trick.0, &mut cam.yaw, grounded, dt);
 
     b.vel_y -= GRAVITY * dt;
-    let flat = intent.dir.normalize_or_zero() * MOVE_SPEED;
+    let speed = MOVE_SPEED * move_multiplier(intent.sprint, !grounded && b.sprint_jump);
+    let flat = intent.dir.normalize_or_zero() * speed;
     controller.translation = Some(Vec3::new(flat.x, b.vel_y, flat.z) * dt);
+}
+
+/// Speed multiplier: sprinting runs 1.4x; a jump taken while sprinting carries 1.24x farther.
+pub fn move_multiplier(sprint: bool, sprint_jump: bool) -> f32 {
+    match (sprint, sprint_jump) {
+        (true, true) => SPRINT_MULT * SPRINT_JUMP_MULT,
+        (true, false) => SPRINT_MULT,
+        _ => 1.0,
+    }
 }
 
 /// Move a trick along. Spins turn the player (and camera) 180 degrees as they go.
@@ -406,8 +522,10 @@ fn combat_input(
     }
     let now = time.elapsed_secs();
     let Some(me) = view.me() else { return };
-    if !locked.0 || !me.alive() || me.stunned > 0.0 {
+    let helpless = me.stunned > 0.0 || me.slimed > 0.0 || me.knocked;
+    if !locked.0 || !me.alive() || helpless {
         charge.started = None;
+        release_lock(&mut lock, &mut actions);
         return;
     }
 
@@ -417,6 +535,7 @@ fn combat_input(
     }
     if !me.holding {
         charge.started = None;
+        release_lock(&mut lock, &mut actions);
         return;
     }
 
@@ -439,12 +558,17 @@ fn combat_input(
     if keys.just_pressed(KeyCode::KeyF) {
         actions.0.push(Action::Throw { aim, charge: 0.0, curve: 0.0, lob: true });
         charge.started = None;
+        release_lock(&mut lock, &mut actions);
         return;
+    }
+    // Lock-on lasts only while charging: just holding the ball lets go of it.
+    if charge.started.is_none() && !mouse.just_pressed(MouseButton::Left) {
+        release_lock(&mut lock, &mut actions);
     }
     if mouse.just_pressed(MouseButton::Left) {
         charge.started = Some(now);
-        // Starting a charge locks on to the nearest enemy (unless already locked).
-        if lock.0.is_none() {
+        // Starting a charge locks on to the nearest enemy.
+        {
             let enemies: Vec<(PlayerId, Vec3)> = view
                 .snap
                 .iter()
@@ -462,6 +586,13 @@ fn combat_input(
         let amount = charge.amount(now).unwrap_or(0.0);
         actions.0.push(Action::Throw { aim, charge: amount, curve, lob: false });
         charge.started = None;
+        release_lock(&mut lock, &mut actions);
+    }
+}
+
+fn release_lock(lock: &mut LockOn, actions: &mut LocalActions) {
+    if lock.0.take().is_some() {
+        actions.0.push(Action::Lock { target: None });
     }
 }
 
@@ -563,6 +694,52 @@ mod tests {
         let enemies = [(1, Vec3::new(0.0, 0.0, 30.0)), (2, Vec3::new(5.0, 0.0, 0.0))];
         assert_eq!(nearest_enemy(&enemies, Vec3::ZERO), Some(2), "nearest, even behind us");
         assert_eq!(nearest_enemy(&[(3, Vec3::new(0.0, 0.0, LOCK_RANGE + 5.0))], Vec3::ZERO), None);
+    }
+
+    #[test]
+    fn two_dashes_then_cooldown() {
+        let mut d = LocalDash::default();
+        assert!(d.try_start(Vec3::X, false));
+        assert!(!d.try_start(Vec3::X, false), "still mid-dash");
+        d.tick(DASH_SECS);
+        assert!(!d.try_start(Vec3::X, false), "0.2 s gap between dashes");
+        d.tick(DASH_GAP);
+        assert!(d.try_start(Vec3::X, false), "second dash");
+        d.tick(DASH_SECS + DASH_GAP);
+        assert!(!d.try_start(Vec3::X, false), "both used");
+        d.tick(DASH_RECHARGE);
+        assert_eq!(d.charges, DASH_CHARGES, "both back 1.5 s after the last dash");
+        assert!(d.try_start(Vec3::X, false));
+    }
+
+    #[test]
+    fn dash_covers_its_distance_and_sprint_adds_24_percent() {
+        let mut d = LocalDash::default();
+        d.try_start(Vec3::new(0.0, 0.0, -2.0), false);
+        assert!((d.velocity.length() * DASH_SECS - DASH_DIST).abs() < 1e-3);
+        let mut s = LocalDash::default();
+        s.try_start(Vec3::NEG_Z, true);
+        assert!((s.velocity.length() / d.velocity.length() - SPRINT_JUMP_MULT).abs() < 1e-4);
+        assert_eq!(d.report(), Some(1));
+        d.tick(1.0);
+        assert_eq!(d.report(), None);
+    }
+
+    #[test]
+    fn sprint_speeds() {
+        assert_eq!(move_multiplier(false, false), 1.0);
+        assert!((move_multiplier(true, false) - 1.4).abs() < 1e-6);
+        assert!((move_multiplier(true, true) - 1.4 * 1.24).abs() < 1e-6);
+        assert_eq!(move_multiplier(false, true), 1.0, "letting go of shift ends the boost");
+    }
+
+    #[test]
+    fn tab_cycles_targets() {
+        let e = [(1, Vec3::new(0.0, 0.0, -10.0)), (2, Vec3::new(5.0, 0.0, -10.0)), (3, Vec3::new(-9.0, 0.0, -3.0))];
+        let (from, fwd) = (Vec3::ZERO, Vec3::NEG_Z);
+        assert_eq!(next_target(&e, None, from, fwd), Some(1));
+        assert_eq!(next_target(&e, Some(1), from, fwd), Some(2));
+        assert_eq!(next_target(&e, Some(3), from, fwd), Some(1), "wraps around");
     }
 
     #[test]

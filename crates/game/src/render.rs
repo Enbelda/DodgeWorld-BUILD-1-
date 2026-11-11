@@ -141,12 +141,14 @@ fn sync_local_body(
     view: Res<View>,
     charge: Res<crate::player::Charge>,
     trick: Res<crate::session::LocalTrick>,
+    dash: Res<crate::player::LocalDash>,
     time: Res<Time>,
     mut rig_input: ResMut<crate::rig::LocalRigInput>,
     body: Single<&mut Visibility, With<LocalBody>>,
 ) {
     rig_input.charge = charge.amount(time.elapsed_secs());
     rig_input.trick = trick.0;
+    rig_input.dashing = dash.dashing();
     let Some(me) = view.me() else { return };
     *body.into_inner() = if me.alive() { Visibility::Inherited } else { Visibility::Hidden };
 }
