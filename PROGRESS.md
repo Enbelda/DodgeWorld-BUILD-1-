@@ -33,11 +33,34 @@
   - Double jump (one extra jump in the air).
   - Protocol bumped to 2 (old builds can't join new hosts).
 
+- **Milestone 1 round 3 (second play-test requests).** 89 game tests + 23 ranked, clippy clean.
+  Verified in LAN autopilot matches: night map + standard, and day + deathmatch to a win
+  (bricks, slime, catches, boomerang, double-jump flips and air spins on both machines).
+  Supersedes some round-2 choices: catch is a timed press again; powered = double damage.
+  - Humanoid models (`rig.rs`): torso, head + visor, two-part arms with hands, two-part legs
+    with feet. Animated: walk cycle, ball held out front, wind-up while charging, throw swing,
+    arms reach forward while catching, spread-eagle when slimed, flat on the back when stunned,
+    tucked flips. White flash on every hit.
+  - Health: 4 hearts (8 halves). Normal/slime/boomerang hit = half a heart, powered = 1 heart,
+    brick = 2 hearts (powered brick = 4). HUD hearts drawn from shapes (no font needed).
+  - Curve and lob: curved/lobbed throws 30% faster, bend/arc 40% stronger (curve accel scaled
+    so the visible bend really grows 40% at the higher speed). Walls raised to 8 m for lobs.
+  - Brick (red block, centre pad): 2 hearts + knocked flat 5 s (no move/throw/catch, drops ball).
+  - Catch: RMB opens a 0.4 s window (time it); 1 s cooldown after a miss.
+  - Lock-on: starting a charge auto-locks the nearest living enemy (Tab still toggles manually).
+  - Deathmatch mode (lobby key M or `--deathmatch`): no respawns, last team standing wins.
+  - Night map (lobby key V or `--night`): dark sky, moon, 450 stars, 10 street lights.
+  - Double jump does a front flip (or back flip when moving backward).
+  - Air tricks: Q/E = 180 spin left/right (really turns you), W+Q/E front flip, S+Q/E back flip.
+    Q/E still curve while charging a throw.
+  - Protocol 3. Bots-only standard match now ~5.5 min (was ~2 with 2 HP).
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`
 - Offline practice: `cargo run -p brawl_game -- --offline --bots 3`
-- Host keys in warm-up: Enter start, B add bot, N remove bot. After a match: Enter back to warm-up.
+- Host keys in warm-up: Enter start, B add bot, N remove bot, M mode, V map. After a match:
+  Enter back to warm-up.
 - Esc frees the mouse; click to capture it again.
 - Testing aids: `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts),
   `--bind 127.0.0.1` (host on loopback only, no firewall prompt).

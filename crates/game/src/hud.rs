@@ -8,7 +8,9 @@ use crate::camera::{CursorLocked, FollowCamera};
 use crate::player::{Charge, LockOn};
 use crate::session::{SessionSet, View};
 use crate::sim::ball::BallKind;
-use crate::sim::{BallState, Phase, PlayerId, PlayerView, Snapshot, Team, KO_TARGET, MAX_HP, MAX_PLAYERS};
+use crate::sim::{
+    BallState, GameMode, MapId, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
+};
 
 /// Enemy balls further than this are not shown as incoming.
 const INCOMING_RANGE: f32 = 30.0;
@@ -26,6 +28,45 @@ enum HudText {
     Alert,
 }
 
+/// The red part of heart `0..HEARTS`; its width shows full, half or empty.
+#[derive(Component)]
+struct HeartFill(u8);
+
+/// Row of hearts, hidden when there is nothing to show.
+#[derive(Component)]
+struct HeartRow;
+
+const HEART_SIZE: f32 = 30.0;
+
+/// A heart from three shapes: two round lobes on top and a square turned 45 degrees for
+/// the point.
+fn spawn_heart_shape(parent: &mut ChildSpawnerCommands, color: Color) {
+    let lobe = HEART_SIZE * 0.54;
+    let at = |left: f32, top: f32, size: f32| Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(left),
+        top: Val::Px(top),
+        width: Val::Px(size),
+        height: Val::Px(size),
+        border_radius: BorderRadius::MAX,
+        ..default()
+    };
+    parent.spawn((at(0.0, 0.0, lobe), BackgroundColor(color)));
+    parent.spawn((at(HEART_SIZE - lobe, 0.0, lobe), BackgroundColor(color)));
+    let point = HEART_SIZE * 0.55;
+    parent.spawn((
+        Node { border_radius: BorderRadius::ZERO, ..at((HEART_SIZE - point) / 2.0, HEART_SIZE * 0.24, point) },
+        BackgroundColor(color),
+        UiTransform::from_rotation(Rot2::degrees(45.0)),
+    ));
+}
+
+/// How full heart `index` is (0, 0.5 or 1) for `hp` half-hearts.
+pub fn heart_fill(hp: u8, index: u8) -> f32 {
+    let halves = hp.saturating_sub(index * 2).min(2);
+    halves as f32 / 2.0
+}
+
 /// "!" that orbits the crosshair, pointing at the closest incoming enemy ball.
 #[derive(Component)]
 struct IncomingMarker;
@@ -34,13 +75,15 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_hud).add_systems(Update, (update_hud, place_incoming_marker).after(SessionSet));
+        app.add_systems(Startup, spawn_hud)
+            .add_systems(Update, (update_hud, update_hearts, place_incoming_marker).after(SessionSet));
     }
 }
 
 const CONTROLS: &str = "WASD move   Space jump (x2 in air)   Mouse aim\n\
-Hold LMB: charge, release: throw   Q/E: curve   F: lob\n\
-Hold RMB: catch (face the ball)   Tab/MMB: lock on   Esc: free mouse";
+Hold LMB: charge (auto lock-on), release: throw   Q/E: curve   F: lob\n\
+RMB: catch - time it! (face the ball)   Tab/MMB: lock on/off\n\
+In the air: Q/E spin 180   W+Q/E front flip   S+Q/E back flip   Esc: free mouse";
 
 fn spawn_hud(mut commands: Commands) {
     let text = |s: &str, size: f32| (Text::new(s), TextFont::from_font_size(size), TextColor(Color::WHITE));
@@ -66,6 +109,55 @@ fn spawn_hud(mut commands: Commands) {
         });
     commands.spawn((text("", 16.0), abs(Some(10.0), None, Some(12.0), None), HudText::Info));
     commands.spawn((text("", 22.0), abs(None, Some(12.0), Some(12.0), None), HudText::Vitals));
+    // Hearts, just above the vitals line. Each heart: a dark heart with a red one on top,
+    // clipped to 0%, 50% or 100% width. Drawn from shapes so no special font is needed.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(44.0),
+                left: Val::Px(12.0),
+                column_gap: Val::Px(4.0),
+                ..default()
+            },
+            Visibility::Hidden,
+            HeartRow,
+        ))
+        .with_children(|row| {
+            for i in 0..HEARTS {
+                let slot_node = Node {
+                    position_type: PositionType::Relative,
+                    width: Val::Px(HEART_SIZE),
+                    height: Val::Px(HEART_SIZE),
+                    ..default()
+                };
+                row.spawn(slot_node).with_children(|slot| {
+                    spawn_heart_shape(slot, Color::srgba(0.08, 0.08, 0.1, 0.75));
+                    slot.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: Val::Px(0.0),
+                            top: Val::Px(0.0),
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(100.0),
+                            overflow: Overflow::clip(),
+                            ..default()
+                        },
+                        HeartFill(i),
+                    ))
+                    .with_children(|clip| {
+                        // Full-size box inside the clip so the heart keeps its shape when cut.
+                        clip.spawn(Node {
+                            position_type: PositionType::Absolute,
+                            width: Val::Px(HEART_SIZE),
+                            height: Val::Px(HEART_SIZE),
+                            ..default()
+                        })
+                        .with_children(|inner| spawn_heart_shape(inner, Color::srgb(0.95, 0.15, 0.2)));
+                    });
+                });
+            }
+        });
     commands.spawn((text("", 18.0), abs(Some(10.0), None, None, Some(12.0)), HudText::Feed));
     commands.spawn((
         Text::new(CONTROLS),
@@ -178,11 +270,17 @@ fn update_hud(
     let me = view.me();
     for (kind, mut text, mut color) in &mut texts {
         let s = match kind {
-            HudText::Score => match snap.map(|s| (s.phase, s.score)) {
+            HudText::Score => match snap.map(|s| (s.phase, s.score, s.mode)) {
                 None => String::new(),
-                Some((Phase::Lobby, _)) => "WARM-UP".to_string(),
-                Some((Phase::Playing, [r, b])) => format!("RED {r}  -  {b} BLUE      first to {KO_TARGET}"),
-                Some((Phase::Ended { winner }, [r, b])) => {
+                Some((Phase::Lobby, _, _)) => "WARM-UP".to_string(),
+                Some((Phase::Playing, _, GameMode::Deathmatch)) => {
+                    let alive = |t: Team| snap.map_or(0, |s| s.players.iter().filter(|p| p.team == t && p.alive()).count());
+                    format!("DEATHMATCH   RED {} standing  -  {} standing BLUE", alive(Team::Red), alive(Team::Blue))
+                }
+                Some((Phase::Playing, [r, b], GameMode::Standard)) => {
+                    format!("RED {r}  -  {b} BLUE      first to {KO_TARGET}")
+                }
+                Some((Phase::Ended { winner }, [r, b], _)) => {
                     let w = if winner == Team::Red { "RED" } else { "BLUE" };
                     format!("{w} WINS   {r} - {b}")
                 }
@@ -194,11 +292,24 @@ fn update_hud(
                     for p in &s.players {
                         let you = if Some(p.id) == view.local { " (you)" } else { "" };
                         let bot = if p.bot { " [bot]" } else { "" };
-                        lines.push(format!("  {:?}  {}{bot}{you}   KO {}  out {}", p.team, p.name, p.kos, p.deaths));
+                        let hearts = p.hp as f32 / 2.0;
+                        lines.push(format!(
+                            "  {:?}  {}{bot}{you}   {hearts:.1} hearts   KO {}  out {}",
+                            p.team, p.name, p.kos, p.deaths
+                        ));
                     }
+                    let mode = match s.mode {
+                        GameMode::Standard => "Standard (respawns, first to 10)",
+                        GameMode::Deathmatch => "Deathmatch (no respawns)",
+                    };
+                    let map = match s.map {
+                        MapId::Day => "Day arena",
+                        MapId::Night => "Night arena",
+                    };
+                    lines.push(format!("Mode: {mode}   Map: {map}"));
                     let host_keys = match s.phase {
-                        Phase::Lobby => "Enter: start match   B: add bot   N: remove bot",
-                        Phase::Ended { .. } => "Enter: back to warm-up",
+                        Phase::Lobby => "Enter: start   B/N: add/remove bot   M: mode   V: map",
+                        Phase::Ended { .. } => "Enter: back to warm-up   M: mode   V: map",
                         Phase::Playing => "",
                     };
                     if view.is_host && !host_keys.is_empty() {
@@ -214,13 +325,20 @@ fn update_hud(
             }
             HudText::Vitals => match me {
                 None => String::new(),
-                Some(m) if !m.alive() => format!("KNOCKED OUT - back in {:.1}s", m.respawn_timer),
+                Some(m) if !m.alive() => {
+                    let out_for_good = snap.is_some_and(|s| s.mode == GameMode::Deathmatch && s.phase == Phase::Playing);
+                    if out_for_good {
+                        "OUT - spectating until the match ends".to_string()
+                    } else {
+                        format!("KNOCKED OUT - back in {:.1}s", m.respawn_timer)
+                    }
+                }
                 Some(m) => {
-                    let hearts = format!("{}{}", "O ".repeat(m.hp as usize), "- ".repeat((MAX_HP - m.hp) as usize));
                     let kind = held_kind(snap, m.id).map_or("", |k| match k {
                         BallKind::Normal => "",
                         BallKind::Boomerang => " BOOMERANG",
                         BallKind::Slime => " SLIME",
+                        BallKind::Brick => " BRICK",
                     });
                     let ball = match (m.holding, m.powered, m.charged) {
                         (true, true, _) => format!("BALL{kind} (POWERED!)"),
@@ -228,8 +346,14 @@ fn update_hud(
                         (true, _, _) => format!("BALL{kind}"),
                         _ => "no ball".to_string(),
                     };
-                    let catch = if m.catching { "CATCHING" } else { "hold RMB to catch" };
-                    let mut s = format!("HP {hearts}  {ball}  {catch}");
+                    let catch = if m.catching {
+                        "CATCHING".to_string()
+                    } else if m.catch_cooldown > 0.0 {
+                        format!("catch in {:.1}s", m.catch_cooldown)
+                    } else {
+                        "catch ready".to_string()
+                    };
+                    let mut s = format!("{ball}   {catch}");
                     if let Some(c) = charge.amount(time.elapsed_secs()) {
                         s.push_str(&format!("\nPOWER {}", bar(c, 20)));
                     }
@@ -252,6 +376,19 @@ fn update_hud(
     }
 }
 
+fn update_hearts(
+    view: Res<View>,
+    row: Single<&mut Visibility, With<HeartRow>>,
+    mut fills: Query<(&HeartFill, &mut Node)>,
+) {
+    let me = view.me().filter(|m| m.alive());
+    *row.into_inner() = if me.is_some() { Visibility::Inherited } else { Visibility::Hidden };
+    let Some(me) = me else { return };
+    for (h, mut node) in &mut fills {
+        node.width = Val::Percent(heart_fill(me.hp, h.0) * 100.0);
+    }
+}
+
 fn held_kind(snap: Option<&Snapshot>, id: PlayerId) -> Option<BallKind> {
     snap?.balls.iter().find(|b| b.state == BallState::Held { by: id }).map(|b| b.kind)
 }
@@ -260,11 +397,14 @@ fn held_kind(snap: Option<&Snapshot>, id: PlayerId) -> Option<BallKind> {
 fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
     let name = |id: PlayerId| s.players.iter().find(|p| p.id == id).map_or("?".to_string(), |p| p.name.clone());
     let mut lines = Vec::new();
+    if me.stunned > 0.0 {
+        lines.push(format!("KNOCKED FLAT! up in {:.1}s", me.stunned));
+    }
     if me.slimed > 0.0 {
         lines.push(format!("SLIMED! stuck {:.1}s", me.slimed));
     }
     if !incoming_balls(s, me).is_empty() {
-        lines.push(if me.catching { "INCOMING - catching!".to_string() } else { "INCOMING!  hold RMB".to_string() });
+        lines.push(if me.catching { "INCOMING - catching!".to_string() } else { "INCOMING!  RMB to catch".to_string() });
     }
     let hunters: Vec<String> = s.players.iter().filter(|p| p.lock == Some(me.id)).map(|p| p.name.clone()).collect();
     if !hunters.is_empty() {
@@ -279,6 +419,17 @@ fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hearts_fill_in_halves() {
+        // 8 half-hearts = 4 full hearts.
+        assert_eq!((0..4).map(|i| heart_fill(8, i)).collect::<Vec<_>>(), [1.0, 1.0, 1.0, 1.0]);
+        // One hit: last heart half gone.
+        assert_eq!((0..4).map(|i| heart_fill(7, i)).collect::<Vec<_>>(), [1.0, 1.0, 1.0, 0.5]);
+        // A brick (4 halves) from full: two hearts left.
+        assert_eq!((0..4).map(|i| heart_fill(4, i)).collect::<Vec<_>>(), [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(heart_fill(0, 0), 0.0);
+    }
 
     #[test]
     fn marker_points_where_the_ball_is() {

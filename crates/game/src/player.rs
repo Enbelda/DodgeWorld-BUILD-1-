@@ -1,16 +1,19 @@
 //! The local player's body (Rapier character controller) and combat input.
 //!
-//! Controls: WASD move, Space jump (again in the air to double jump), hold Left Mouse to
-//! charge and release to throw, hold Q / E while throwing to curve, F to lob,
-//! hold Right Mouse to catch, Tab or Middle Mouse to lock on.
+//! Controls: WASD move, Space jump (again in the air to double jump with a flip), hold Left
+//! Mouse to charge (auto-locks the nearest enemy) and release to throw, hold Q / E while
+//! throwing to curve, F to lob, Right Mouse to catch (time it), Tab or Middle Mouse to lock on.
+//! In the air: Q / E spin 180 left / right; W+Q/E front flip, S+Q/E back flip.
 
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::camera::{CursorLocked, FollowCamera};
-use crate::session::{CatchHold, LocalActions, View};
+use crate::session::{LocalActions, LocalTrick, View};
 use crate::sim::bot::yaw_toward;
-use crate::sim::{layout, Action, PlayerId, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT, LOCK_RANGE};
+use crate::sim::{
+    layout, Action, PlayerId, TrickKind, TrickState, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT, LOCK_RANGE,
+};
 
 const MOVE_SPEED: f32 = 7.0;
 const JUMP_SPEED: f32 = 8.0;
@@ -18,8 +21,10 @@ const DOUBLE_JUMP_SPEED: f32 = 7.5;
 /// Extra jumps allowed in the air.
 pub const AIR_JUMPS: u8 = 1;
 const GRAVITY: f32 = 22.0;
-/// Movement speed multiplier while holding the catch button.
-pub const CATCH_MOVE_FACTOR: f32 = 0.6;
+/// How long a flip or spin takes.
+pub const TRICK_SECS: f32 = 0.55;
+/// How much of the stick counts as "moving forward/backward" for picking a flip.
+const FLIP_INPUT: f32 = 0.3;
 /// Lock-on picks the enemy closest to the crosshair inside this cone (radians).
 pub const LOCK_CONE: f32 = 0.6;
 /// How quickly the camera turns toward a locked target (higher = snappier).
@@ -48,6 +53,14 @@ pub struct Charge {
 pub struct MoveIntent {
     pub dir: Vec3,
     pub jump: bool,
+    /// Q (left) or E (right) pressed for an air trick.
+    pub trick: Option<Side>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Left,
+    Right,
 }
 
 /// `--autopilot`: the local player is driven by bot logic (for automated play-tests).
@@ -91,12 +104,12 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-fn spawn_local_body(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut materials: ResMut<Assets<StandardMaterial>>) {
+fn spawn_local_body(mut commands: Commands) {
     let half_segment = (BODY_HEIGHT - 2.0 * BODY_RADIUS) / 2.0;
+    // No mesh: the humanoid rig is attached as a child by the renderer.
     commands.spawn((
         LocalBody::default(),
-        Mesh3d(meshes.add(Capsule3d::new(BODY_RADIUS, half_segment * 2.0))),
-        MeshMaterial3d(materials.add(Color::srgb(0.8, 0.8, 0.8))),
+        Visibility::default(),
         Transform::from_translation(layout::spawn_point(true, 0) + Vec3::Y * FEET_OFFSET),
         Collider::capsule_y(half_segment, BODY_RADIUS),
         KinematicCharacterController {
@@ -139,6 +152,39 @@ pub fn try_jump(grounded: bool, air_jumps: u8) -> Option<(f32, u8)> {
     } else {
         None
     }
+}
+
+/// Which flip a double jump does: back flip when moving backward, front flip otherwise.
+/// `forward` is how much the movement points along the camera's facing (-1..1).
+pub fn double_jump_flip(forward: f32) -> TrickKind {
+    if forward < -FLIP_INPUT {
+        TrickKind::BackFlip
+    } else {
+        TrickKind::FrontFlip
+    }
+}
+
+/// Which trick Q/E does in the air: W/S held picks a flip, otherwise a 180 spin that way.
+pub fn air_trick(forward: f32, side: Side) -> TrickKind {
+    if forward > FLIP_INPUT {
+        TrickKind::FrontFlip
+    } else if forward < -FLIP_INPUT {
+        TrickKind::BackFlip
+    } else if side == Side::Left {
+        TrickKind::SpinLeft
+    } else {
+        TrickKind::SpinRight
+    }
+}
+
+/// The closest living enemy within lock range (used when charging starts).
+pub fn nearest_enemy(enemies: &[(PlayerId, Vec3)], from: Vec3) -> Option<PlayerId> {
+    enemies
+        .iter()
+        .map(|&(id, pos)| (pos.distance(from), id))
+        .filter(|(d, _)| *d <= LOCK_RANGE)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, id)| id)
 }
 
 /// The enemy nearest the crosshair: within `LOCK_RANGE` and `LOCK_CONE` of `forward`.
@@ -240,6 +286,7 @@ fn lock_camera(
 
 fn keyboard_intent(
     keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     auto: Res<Autopilot>,
     cam: Single<&FollowCamera>,
     mut intent: ResMut<MoveIntent>,
@@ -249,6 +296,13 @@ fn keyboard_intent(
     }
     intent.dir = input_direction(&keys, cam.yaw);
     intent.jump = keys.just_pressed(KeyCode::Space);
+    // While charging a throw, Q/E curve the ball instead of doing tricks.
+    let charging = mouse.pressed(MouseButton::Left);
+    intent.trick = match (keys.just_pressed(KeyCode::KeyQ), keys.just_pressed(KeyCode::KeyE)) {
+        (true, false) if !charging => Some(Side::Left),
+        (false, true) if !charging => Some(Side::Right),
+        _ => None,
+    };
 }
 
 #[allow(clippy::type_complexity)]
@@ -256,8 +310,8 @@ pub fn move_local_body(
     time: Res<Time>,
     intent: Res<MoveIntent>,
     view: Res<View>,
-    catch_hold: Res<CatchHold>,
-    cam: Single<&FollowCamera>,
+    mut trick: ResMut<LocalTrick>,
+    mut cam: Single<&mut FollowCamera>,
     body: Single<(
         &mut LocalBody,
         &mut Transform,
@@ -271,10 +325,12 @@ pub fn move_local_body(
     tf.rotation = Quat::from_rotation_y(cam.yaw);
     if !me.is_none_or(|m| m.alive()) {
         controller.translation = None;
+        trick.0 = None;
         return;
     }
-    // Slimed: the host drags us to the wall and holds us there.
-    if let Some(m) = me.filter(|m| m.slimed > 0.0) {
+    // Slimed or knocked flat: the host owns our position.
+    if let Some(m) = me.filter(|m| m.slimed > 0.0 || m.stunned > 0.0) {
+        trick.0 = None;
         let target = Vec3::from_array(m.pos) + Vec3::Y * FEET_OFFSET;
         tf.translation = tf.translation.lerp(target, 1.0 - (-20.0 * dt).exp());
         controller.translation = None;
@@ -287,16 +343,46 @@ pub fn move_local_body(
         b.vel_y = 0.0;
         b.air_jumps = AIR_JUMPS;
     }
+    let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+    let fwd_amount = intent.dir.normalize_or_zero().dot(forward);
     if intent.jump {
         if let Some((vy, left)) = try_jump(grounded, b.air_jumps) {
             b.vel_y = vy;
             b.air_jumps = left;
+            if !grounded {
+                // The second jump flips: forward or backward with the movement.
+                trick.0 = Some(TrickState { kind: double_jump_flip(fwd_amount), progress: 0.0 });
+            }
         }
     }
+    if let Some(side) = intent.trick {
+        if !grounded && trick.0.is_none() {
+            trick.0 = Some(TrickState { kind: air_trick(fwd_amount, side), progress: 0.0 });
+        }
+    }
+    advance_trick(&mut trick.0, &mut cam.yaw, grounded, dt);
+
     b.vel_y -= GRAVITY * dt;
-    let speed = if catch_hold.0 { MOVE_SPEED * CATCH_MOVE_FACTOR } else { MOVE_SPEED };
-    let flat = intent.dir.normalize_or_zero() * speed;
+    let flat = intent.dir.normalize_or_zero() * MOVE_SPEED;
     controller.translation = Some(Vec3::new(flat.x, b.vel_y, flat.z) * dt);
+}
+
+/// Move a trick along. Spins turn the player (and camera) 180 degrees as they go.
+/// Flips end early on landing.
+pub fn advance_trick(trick: &mut Option<TrickState>, yaw: &mut f32, grounded: bool, dt: f32) {
+    let Some(t) = trick.as_mut() else { return };
+    let before = t.progress;
+    t.progress = (t.progress + dt / TRICK_SECS).min(1.0);
+    let turned = (t.progress - before) * std::f32::consts::PI;
+    match t.kind {
+        TrickKind::SpinLeft => *yaw += turned,
+        TrickKind::SpinRight => *yaw -= turned,
+        TrickKind::FrontFlip | TrickKind::BackFlip => {}
+    }
+    let flip = matches!(t.kind, TrickKind::FrontFlip | TrickKind::BackFlip);
+    if t.progress >= 1.0 || (flip && grounded && t.progress > 0.3) {
+        *trick = None;
+    }
 }
 
 /// Throw, lob and catch. Only queues actions that could succeed right now.
@@ -308,10 +394,9 @@ fn combat_input(
     locked: Res<CursorLocked>,
     auto: Res<Autopilot>,
     view: Res<View>,
-    lock: Res<LockOn>,
+    mut lock: ResMut<LockOn>,
     mut charge: ResMut<Charge>,
     mut actions: ResMut<LocalActions>,
-    mut catch_hold: ResMut<CatchHold>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&Transform, (With<FollowCamera>, Without<LocalBody>)>,
     follow: Single<&FollowCamera>,
@@ -321,14 +406,15 @@ fn combat_input(
     }
     let now = time.elapsed_secs();
     let Some(me) = view.me() else { return };
-    if !locked.0 || !me.alive() {
+    if !locked.0 || !me.alive() || me.stunned > 0.0 {
         charge.started = None;
-        catch_hold.0 = false;
         return;
     }
 
-    // Hold right mouse: the catch fires the moment a ball arrives.
-    catch_hold.0 = mouse.pressed(MouseButton::Right) && !me.holding;
+    // Right mouse opens a short catch window: press it just before the ball arrives.
+    if mouse.just_pressed(MouseButton::Right) && !me.holding && me.catch_cooldown <= 0.0 {
+        actions.0.push(Action::Catch);
+    }
     if !me.holding {
         charge.started = None;
         return;
@@ -357,6 +443,20 @@ fn combat_input(
     }
     if mouse.just_pressed(MouseButton::Left) {
         charge.started = Some(now);
+        // Starting a charge locks on to the nearest enemy (unless already locked).
+        if lock.0.is_none() {
+            let enemies: Vec<(PlayerId, Vec3)> = view
+                .snap
+                .iter()
+                .flat_map(|s| s.players.iter())
+                .filter(|p| p.team != me.team && p.alive())
+                .map(|p| (p.id, Vec3::from_array(p.pos)))
+                .collect();
+            if let Some(t) = nearest_enemy(&enemies, feet) {
+                lock.0 = Some(t);
+                actions.0.push(Action::Lock { target: Some(t) });
+            }
+        }
     }
     if mouse.just_released(MouseButton::Left) {
         let amount = charge.amount(now).unwrap_or(0.0);
@@ -415,6 +515,54 @@ mod tests {
         // Behind us or too far: nothing.
         assert_eq!(pick_lock_target(&[(3, Vec3::new(0.0, 0.0, 10.0))], from, fwd), None);
         assert_eq!(pick_lock_target(&[(4, Vec3::new(0.0, 0.0, -LOCK_RANGE - 1.0))], from, fwd), None);
+    }
+
+    #[test]
+    fn double_jump_flips_with_movement() {
+        assert_eq!(double_jump_flip(1.0), TrickKind::FrontFlip);
+        assert_eq!(double_jump_flip(-1.0), TrickKind::BackFlip);
+        assert_eq!(double_jump_flip(0.0), TrickKind::FrontFlip, "standing still flips forward");
+    }
+
+    #[test]
+    fn q_and_e_pick_air_tricks() {
+        assert_eq!(air_trick(0.0, Side::Left), TrickKind::SpinLeft);
+        assert_eq!(air_trick(0.0, Side::Right), TrickKind::SpinRight);
+        assert_eq!(air_trick(1.0, Side::Left), TrickKind::FrontFlip);
+        assert_eq!(air_trick(-1.0, Side::Right), TrickKind::BackFlip);
+    }
+
+    #[test]
+    fn spins_turn_exactly_half_a_circle() {
+        let mut t = Some(TrickState { kind: TrickKind::SpinLeft, progress: 0.0 });
+        let mut yaw = 0.0;
+        for _ in 0..100 {
+            advance_trick(&mut t, &mut yaw, true, 1.0 / 60.0);
+        }
+        assert!(t.is_none());
+        assert!((yaw - std::f32::consts::PI).abs() < 1e-4, "{yaw}");
+        let mut t = Some(TrickState { kind: TrickKind::SpinRight, progress: 0.0 });
+        let mut yaw = 0.0;
+        for _ in 0..100 {
+            advance_trick(&mut t, &mut yaw, false, 1.0 / 60.0);
+        }
+        assert!((yaw + std::f32::consts::PI).abs() < 1e-4);
+    }
+
+    #[test]
+    fn flip_ends_on_landing() {
+        let mut t = Some(TrickState { kind: TrickKind::FrontFlip, progress: 0.5 });
+        let mut yaw = 0.0;
+        advance_trick(&mut t, &mut yaw, true, 0.01);
+        assert!(t.is_none());
+        assert_eq!(yaw, 0.0, "flips don't turn you");
+    }
+
+    #[test]
+    fn charge_locks_nearest_enemy_in_range() {
+        let enemies = [(1, Vec3::new(0.0, 0.0, 30.0)), (2, Vec3::new(5.0, 0.0, 0.0))];
+        assert_eq!(nearest_enemy(&enemies, Vec3::ZERO), Some(2), "nearest, even behind us");
+        assert_eq!(nearest_enemy(&[(3, Vec3::new(0.0, 0.0, LOCK_RANGE + 5.0))], Vec3::ZERO), None);
     }
 
     #[test]

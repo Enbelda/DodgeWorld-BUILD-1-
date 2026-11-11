@@ -13,7 +13,11 @@ use layout::{Aabb, ARENA_HALF};
 
 pub type PlayerId = u8;
 pub const MAX_PLAYERS: usize = 4;
-pub const MAX_HP: u8 = 2;
+/// Health in half-hearts: 4 hearts = 8 halves. A normal hit takes one half.
+pub const MAX_HP: u8 = 8;
+pub const HEARTS: u8 = 4;
+/// How long a brick knocks its target flat.
+pub const STUN_SECS: f32 = 5.0;
 pub const KO_TARGET: u32 = 10;
 pub const RESPAWN_SECS: f32 = 3.0;
 pub const CATCH_WINDOW: f32 = 0.4;
@@ -70,6 +74,39 @@ pub enum Action {
     Lock { target: Option<PlayerId> },
 }
 
+/// Standard: knocked-out players respawn, first team to `KO_TARGET` wins.
+/// Deathmatch: no respawns, the last team with someone standing wins.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GameMode {
+    #[default]
+    Standard,
+    Deathmatch,
+}
+
+/// Which look the arena has. Geometry is the same.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MapId {
+    #[default]
+    Day,
+    Night,
+}
+
+/// Air tricks. Flips are animations; spins also turn the player 180 degrees.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TrickKind {
+    FrontFlip,
+    BackFlip,
+    SpinLeft,
+    SpinRight,
+}
+
+/// A trick in progress (0..1), reported by the client so others can see it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct TrickState {
+    pub kind: TrickKind,
+    pub progress: f32,
+}
+
 /// A slimed player is dragged to `anchor` on the nearest wall and held there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slime {
@@ -94,12 +131,15 @@ pub struct Player {
     pub charged: bool,
     pub catch_window: f32,
     pub catch_cooldown: f32,
-    /// Holding the catch button: catches the moment a ball arrives.
-    pub catch_held: bool,
     pub throw_cooldown: f32,
     /// Enemy this player is locked on to; their throws home in on it.
     pub lock: Option<PlayerId>,
     pub slime: Option<Slime>,
+    /// > 0 while knocked flat by a brick: no moving, throwing or catching.
+    pub stun: f32,
+    pub trick: Option<TrickState>,
+    /// Bumped on every hit taken, so clients can flash the model.
+    pub hits: u32,
     /// > 0 while knocked out.
     pub respawn_timer: f32,
     /// Bumped every time the host teleports this player (respawn), so clients snap to it.
@@ -120,7 +160,7 @@ impl Player {
         self.pos + Vec3::Y * HOLD_HEIGHT + self.forward() * 0.45
     }
     pub fn catching(&self) -> bool {
-        self.catch_window > 0.0 || self.catch_held
+        self.catch_window > 0.0
     }
 }
 
@@ -158,6 +198,7 @@ pub enum GameEvent {
     Knockout { thrower: PlayerId, target: PlayerId },
     Caught { catcher: PlayerId, thrower: PlayerId },
     Slimed { thrower: PlayerId, target: PlayerId },
+    Stunned { thrower: PlayerId, target: PlayerId },
     BoomerangBack { owner: PlayerId },
     MatchStarted,
     MatchEnded { winner: Team },
@@ -165,6 +206,8 @@ pub enum GameEvent {
 
 pub struct Match {
     pub phase: Phase,
+    pub mode: GameMode,
+    pub map: MapId,
     pub players: Vec<Player>,
     pub balls: Vec<Ball>,
     pub score: [u32; 2],
@@ -184,6 +227,8 @@ impl Match {
     pub fn new() -> Self {
         let mut m = Match {
             phase: Phase::Lobby,
+            mode: GameMode::Standard,
+            map: MapId::Day,
             players: Vec::new(),
             balls: Vec::new(),
             score: [0, 0],
@@ -234,10 +279,12 @@ impl Match {
             charged: false,
             catch_window: 0.0,
             catch_cooldown: 0.0,
-            catch_held: false,
             throw_cooldown: 0.0,
             lock: None,
             slime: None,
+            stun: 0.0,
+            trick: None,
+            hits: 0,
             respawn_timer: 0.0,
             teleports: 0,
             kos: 0,
@@ -279,12 +326,14 @@ impl Match {
     }
 
     /// A human client reports where its body is (movement is client-side).
-    /// While slimed the host owns the position; only the facing is taken.
+    /// While slimed or stunned the host owns the position; only the facing is taken.
     pub fn set_pose(&mut self, id: PlayerId, pos: Vec3, yaw: f32) {
         if let Some(p) = self.player_mut(id) {
             if p.alive() && pos.is_finite() && yaw.is_finite() {
-                p.yaw = yaw;
-                if p.slime.is_none() {
+                if p.stun <= 0.0 {
+                    p.yaw = yaw;
+                }
+                if p.slime.is_none() && p.stun <= 0.0 {
                     let lim = ARENA_HALF + 2.0;
                     p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
                 }
@@ -292,11 +341,30 @@ impl Match {
         }
     }
 
-    /// A human holds (or releases) the catch button.
-    pub fn set_catch_hold(&mut self, id: PlayerId, held: bool) {
+    /// A client reports the air trick it is doing (for everyone else to see).
+    pub fn set_trick(&mut self, id: PlayerId, trick: Option<TrickState>) {
         if let Some(p) = self.player_mut(id) {
-            p.catch_held = held && p.alive();
+            p.trick = trick.filter(|t| t.progress.is_finite()).map(|t| TrickState {
+                kind: t.kind,
+                progress: t.progress.clamp(0.0, 1.0),
+            });
         }
+    }
+
+    /// Mode and map can only change between matches.
+    pub fn set_mode(&mut self, mode: GameMode) -> bool {
+        if self.phase == Phase::Playing {
+            return false;
+        }
+        self.mode = mode;
+        true
+    }
+    pub fn set_map(&mut self, map: MapId) -> bool {
+        if self.phase == Phase::Playing {
+            return false;
+        }
+        self.map = map;
+        true
     }
 
     /// Can a match start? Needs two players; teams are rebalanced on start.
@@ -325,10 +393,39 @@ impl Match {
         true
     }
 
-    /// Back to the lobby after a match.
+    /// Back to the lobby after a match. Everyone still out comes back.
     pub fn to_lobby(&mut self) {
         self.phase = Phase::Lobby;
         self.score = [0, 0];
+        let out: Vec<PlayerId> = self.players.iter().filter(|p| !p.alive()).map(|p| p.id).collect();
+        for id in out {
+            self.respawn(id);
+        }
+    }
+
+    /// Deathmatch: is anyone on `team` still standing?
+    fn team_alive(&self, team: Team) -> bool {
+        self.players.iter().any(|p| p.team == team && p.alive())
+    }
+
+    /// Deathmatch ends when a team has nobody standing.
+    fn check_elimination(&mut self) {
+        if self.mode != GameMode::Deathmatch || self.phase != Phase::Playing {
+            return;
+        }
+        let (red, blue) = (self.team_alive(Team::Red), self.team_alive(Team::Blue));
+        let winner = match (red, blue) {
+            (true, false) => Team::Red,
+            (false, true) => Team::Blue,
+            _ => return,
+        };
+        self.phase = Phase::Ended { winner };
+        self.events.push(GameEvent::MatchEnded { winner });
+    }
+
+    /// Respawns are off during a deathmatch.
+    fn respawns_enabled(&self) -> bool {
+        !(self.mode == GameMode::Deathmatch && self.phase == Phase::Playing)
     }
 
     /// Alternate players across teams so sizes differ by at most one.
@@ -363,6 +460,8 @@ impl Match {
         p.catch_window = 0.0;
         p.catch_cooldown = 0.0;
         p.slime = None;
+        p.stun = 0.0;
+        p.trick = None;
         p.lock = None;
         p.teleports = p.teleports.wrapping_add(1);
     }
@@ -370,7 +469,12 @@ impl Match {
     /// Apply a player action. Invalid actions (dead, no ball, on cooldown) are ignored.
     pub fn apply(&mut self, id: PlayerId, action: Action) {
         let Some(pi) = self.players.iter().position(|p| p.id == id) else { return };
-        if !self.players[pi].alive() || matches!(self.phase, Phase::Ended { .. }) {
+        let p = &self.players[pi];
+        if !p.alive() || matches!(self.phase, Phase::Ended { .. }) {
+            return;
+        }
+        // Knocked flat: can't do anything but wait (letting go of a lock is fine).
+        if p.stun > 0.0 && !matches!(action, Action::Lock { target: None }) {
             return;
         }
         match action {
@@ -423,6 +527,7 @@ impl Match {
         self.run_bots(dt);
         self.step_balls(dt);
         self.pickups();
+        self.check_elimination();
     }
 
     fn tick_players(&mut self, dt: f32) {
@@ -432,8 +537,10 @@ impl Match {
         for (p, lock) in self.players.iter_mut().zip(locks) {
             p.lock = lock;
         }
+        let respawns = self.respawns_enabled();
         let mut to_respawn = Vec::new();
         for p in &mut self.players {
+            p.stun = (p.stun - dt).max(0.0);
             if let Some(sl) = p.slime.as_mut() {
                 let to = Vec3::new(sl.anchor.x - p.pos.x, 0.0, sl.anchor.z - p.pos.z);
                 let step = SLIME_KNOCK_SPEED * dt;
@@ -452,9 +559,11 @@ impl Match {
             p.catch_cooldown = (p.catch_cooldown - dt).max(0.0);
             p.throw_cooldown = (p.throw_cooldown - dt).max(0.0);
             if p.respawn_timer > 0.0 {
-                p.respawn_timer -= dt;
-                if p.respawn_timer <= 0.0 {
-                    to_respawn.push(p.id);
+                if respawns {
+                    p.respawn_timer -= dt;
+                    if p.respawn_timer <= 0.0 {
+                        to_respawn.push(p.id);
+                    }
                 }
             } else if p.pos.y < -10.0 {
                 // Fell out of the world: counts as a knockout with no thrower credit.
@@ -468,7 +577,8 @@ impl Match {
     }
 
     fn run_bots(&mut self, dt: f32) {
-        let ids: Vec<PlayerId> = self.players.iter().filter(|p| p.bot && p.alive()).map(|p| p.id).collect();
+        let ids: Vec<PlayerId> =
+            self.players.iter().filter(|p| p.bot && p.alive() && p.stun <= 0.0).map(|p| p.id).collect();
         for id in ids {
             let actions = bot::think(self, id, dt);
             for a in actions {
@@ -596,11 +706,27 @@ impl Match {
         };
         b.vel = Vec3::new(-ball_vel.x * 0.15, 3.0, -ball_vel.z * 0.15);
 
-        let dmg = if powered { MAX_HP } else { 1 };
+        let dmg = kind.damage(powered);
         let t = &mut self.players[ti];
         t.hp = t.hp.saturating_sub(dmg);
+        t.hits = t.hits.wrapping_add(1);
         if t.hp > 0 {
             self.events.push(GameEvent::Hit { thrower, target });
+            if kind == BallKind::Brick {
+                let t = &mut self.players[ti];
+                t.stun = STUN_SECS;
+                t.catch_window = 0.0;
+                t.trick = None;
+                t.pos.y = 0.0; // knocked to the floor
+                // Knocked flat: drop whatever was in hand.
+                if let Some(held) = t.holding.take() {
+                    t.powered = false;
+                    t.charged = false;
+                    self.balls[held].state = BallState::Free;
+                    self.balls[held].vel = Vec3::Y * 2.0;
+                }
+                self.events.push(GameEvent::Stunned { thrower, target });
+            }
             if kind == BallKind::Slime {
                 let anchor = layout::nearest_wall_anchor(self.players[ti].pos, &self.solids, BODY_RADIUS);
                 self.players[ti].slime = Some(Slime { anchor, timer: SLIME_SECS });
@@ -610,8 +736,9 @@ impl Match {
         }
         t.respawn_timer = RESPAWN_SECS;
         t.catch_window = 0.0;
-        t.catch_held = false;
         t.slime = None;
+        t.stun = 0.0;
+        t.trick = None;
         let counts = self.phase == Phase::Playing;
         if counts {
             t.deaths += 1;
@@ -661,6 +788,8 @@ impl Match {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             phase: self.phase,
+            mode: self.mode,
+            map: self.map,
             score: self.score,
             players: self
                 .players
@@ -679,6 +808,9 @@ impl Match {
                     catching: p.catching(),
                     lock: p.lock,
                     slimed: p.slime.map_or(0.0, |s| s.timer),
+                    stunned: p.stun,
+                    trick: p.trick,
+                    hits: p.hits,
                     catch_cooldown: p.catch_cooldown,
                     respawn_timer: p.respawn_timer.max(0.0),
                     teleports: p.teleports,
@@ -715,6 +847,8 @@ pub fn segment_hits_body(a: Vec3, b: Vec3, feet: Vec3) -> Option<f32> {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Snapshot {
     pub phase: Phase,
+    pub mode: GameMode,
+    pub map: MapId,
     pub score: [u32; 2],
     pub players: Vec<PlayerView>,
     pub balls: Vec<BallView>,
@@ -738,6 +872,10 @@ pub struct PlayerView {
     pub lock: Option<PlayerId>,
     /// Seconds of slime left (0 = free).
     pub slimed: f32,
+    /// Seconds left knocked flat by a brick (0 = up).
+    pub stunned: f32,
+    pub trick: Option<TrickState>,
+    pub hits: u32,
     pub respawn_timer: f32,
     pub teleports: u32,
     pub kos: u32,
@@ -905,12 +1043,12 @@ mod tests {
     }
 
     #[test]
-    fn powered_throw_knocks_out_in_one_hit() {
+    fn powered_throw_does_double_damage() {
         let (mut m, red, blue) = duel();
         m.players.iter_mut().find(|p| p.id == red).unwrap().powered = true;
         throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
         run(&mut m, 0.5);
-        assert!(!m.player(blue).unwrap().alive());
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 2);
     }
 
     #[test]
@@ -995,26 +1133,100 @@ mod tests {
     }
 
     #[test]
-    fn held_catch_catches_whenever_the_ball_arrives() {
+    fn catch_too_early_misses_and_goes_on_cooldown() {
         let (mut m, red, blue) = duel();
-        // Catch held well before the throw: no timing window needed.
-        m.set_catch_hold(blue, true);
-        run(&mut m, 1.0);
-        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
-        run(&mut m, 0.5);
-        let b = m.player(blue).unwrap();
-        assert_eq!(b.hp, MAX_HP);
-        assert_eq!(b.holding, Some(0));
-    }
-
-    #[test]
-    fn released_catch_does_not_catch() {
-        let (mut m, red, blue) = duel();
-        m.set_catch_hold(blue, true);
-        m.set_catch_hold(blue, false);
+        m.apply(blue, Action::Catch);
+        run(&mut m, 0.5); // window over, still on cooldown
+        m.apply(blue, Action::Catch); // ignored: cooldown
         throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
         run(&mut m, 0.5);
         assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1);
+    }
+
+    #[test]
+    fn hearts_are_eight_halves() {
+        assert_eq!(MAX_HP, HEARTS * 2);
+    }
+
+    #[test]
+    fn brick_takes_two_hearts_and_knocks_flat() {
+        let (mut m, red, blue) = duel();
+        m.balls[0].kind = BallKind::Brick;
+        let hits_before = m.player(blue).unwrap().hits;
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.5);
+        let b = m.player(blue).unwrap();
+        assert_eq!(b.hp, MAX_HP - 4, "two full hearts");
+        assert!(b.stun > STUN_SECS - 0.5);
+        assert_eq!(b.hits, hits_before + 1);
+        assert!(m.events.contains(&GameEvent::Stunned { thrower: red, target: blue }));
+        // Can't move, throw or catch while flat.
+        let at = b.pos;
+        m.set_pose(blue, at + Vec3::X * 3.0, 0.0);
+        assert_eq!(m.player(blue).unwrap().pos, at);
+        m.apply(blue, Action::Catch);
+        assert_eq!(m.player(blue).unwrap().catch_window, 0.0);
+        run(&mut m, STUN_SECS);
+        assert_eq!(m.player(blue).unwrap().stun, 0.0, "gets back up");
+        m.set_pose(blue, at + Vec3::X * 3.0, 0.0);
+        assert_eq!(m.player(blue).unwrap().pos, at + Vec3::X * 3.0);
+    }
+
+    #[test]
+    fn deathmatch_has_no_respawns_and_ends_on_elimination() {
+        let (mut m, red, blue) = duel();
+        m.phase = Phase::Lobby;
+        assert!(m.set_mode(GameMode::Deathmatch));
+        m.start();
+        m.balls = vec![Ball::new(LANE, BallKind::Normal)];
+        m.set_pose(red, LANE, 0.0);
+        m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), std::f32::consts::PI);
+        m.step(DT);
+        m.players.iter_mut().find(|p| p.id == blue).unwrap().hp = 1;
+        throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
+        run(&mut m, 0.6);
+        assert!(!m.player(blue).unwrap().alive());
+        assert_eq!(m.phase, Phase::Ended { winner: Team::Red }, "blue team wiped out");
+        // Back in the lobby everyone is up again.
+        m.to_lobby();
+        assert!(m.player(blue).unwrap().alive());
+    }
+
+    #[test]
+    fn deathmatch_keeps_out_players_out() {
+        let mut m = Match::new();
+        for i in 0..4 {
+            m.add_player(&format!("p{i}"), false);
+        }
+        m.set_mode(GameMode::Deathmatch);
+        m.start();
+        // Knock out one of two reds: match goes on, they stay out.
+        let red = m.players.iter().find(|p| p.team == Team::Red).unwrap().id;
+        m.players.iter_mut().find(|p| p.id == red).unwrap().respawn_timer = RESPAWN_SECS;
+        run(&mut m, RESPAWN_SECS + 1.0);
+        assert!(!m.player(red).unwrap().alive());
+        assert_eq!(m.phase, Phase::Playing);
+    }
+
+    #[test]
+    fn mode_and_map_only_change_between_matches() {
+        let (mut m, _, _) = duel();
+        assert!(!m.set_mode(GameMode::Deathmatch));
+        assert!(!m.set_map(MapId::Night));
+        m.to_lobby();
+        assert!(m.set_map(MapId::Night));
+        assert_eq!(m.snapshot().map, MapId::Night);
+    }
+
+    #[test]
+    fn trick_is_reported_and_cleared() {
+        let (mut m, red, _) = duel();
+        m.set_trick(red, Some(TrickState { kind: TrickKind::BackFlip, progress: 0.4 }));
+        let snap = m.snapshot();
+        let r = snap.players.iter().find(|p| p.id == red).unwrap();
+        assert_eq!(r.trick.map(|t| t.kind), Some(TrickKind::BackFlip));
+        m.set_trick(red, None);
+        assert!(m.player(red).unwrap().trick.is_none());
     }
 
     #[test]
@@ -1135,7 +1347,8 @@ mod tests {
     #[test]
     fn match_has_one_boomerang_and_one_slime() {
         let m = Match::new();
-        assert_eq!(m.balls.len(), 6);
+        assert_eq!(m.balls.len(), 7);
+        assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Brick).count(), 1);
         assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Boomerang).count(), 1);
         assert_eq!(m.balls.iter().filter(|b| b.kind == BallKind::Slime).count(), 1);
     }

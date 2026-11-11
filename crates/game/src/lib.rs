@@ -8,6 +8,7 @@ pub mod hud;
 pub mod net;
 pub mod player;
 pub mod render;
+pub mod rig;
 pub mod session;
 pub mod sim;
 
@@ -26,6 +27,7 @@ pub fn run(cfg: LaunchConfig) -> Result<(), String> {
         }))
         .add_plugins(RapierPhysicsPlugin::<NoUserData>::default())
         .insert_resource(ClearColor(Color::srgb(0.53, 0.75, 0.92)))
+        .init_resource::<GlobalAmbientLight>()
         .insert_resource(session)
         .insert_resource(player::Autopilot(cfg.autopilot))
         .insert_resource(session::View { status, ..default() })

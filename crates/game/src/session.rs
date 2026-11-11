@@ -7,7 +7,7 @@ use crate::camera::FollowCamera;
 use crate::config::{LaunchConfig, Mode};
 use crate::net::{ClientNet, ClientStatus, HostNet};
 use crate::player::{LocalBody, FEET_OFFSET};
-use crate::sim::{Action, GameEvent, Match, Phase, PlayerId, Snapshot};
+use crate::sim::{Action, GameEvent, GameMode, Match, MapId, Phase, PlayerId, Snapshot, TrickState};
 
 const SIM_DT: f32 = 1.0 / 60.0;
 const SEND_INTERVAL: f32 = 1.0 / 30.0;
@@ -59,9 +59,9 @@ impl View {
 #[derive(Resource, Default)]
 pub struct LocalActions(pub Vec<Action>);
 
-/// The local player is holding the catch button.
+/// The air trick the local player is doing, reported to the host for others to see.
 #[derive(Resource, Default)]
-pub struct CatchHold(pub bool);
+pub struct LocalTrick(pub Option<TrickState>);
 
 pub fn build_session(cfg: &LaunchConfig) -> Result<(Session, String), String> {
     match &cfg.mode {
@@ -70,6 +70,12 @@ pub fn build_session(cfg: &LaunchConfig) -> Result<(Session, String), String> {
             let local = sim.add_player(&cfg.name, false).expect("empty match has room");
             for i in 0..cfg.bots {
                 sim.add_player(&format!("Bot {}", i + 1), true);
+            }
+            if cfg.deathmatch {
+                sim.set_mode(GameMode::Deathmatch);
+            }
+            if cfg.night {
+                sim.set_map(MapId::Night);
             }
             let (net, status) = if *lan {
                 let ip = cfg.bind.unwrap_or([0, 0, 0, 0].into());
@@ -96,7 +102,7 @@ impl Plugin for SessionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<View>()
             .init_resource::<LocalActions>()
-            .init_resource::<CatchHold>()
+            .init_resource::<LocalTrick>()
             .add_systems(Update, (host_controls, tick_session).chain().in_set(SessionSet));
     }
 }
@@ -116,6 +122,20 @@ fn host_controls(
     let peers_ready = host.net.as_ref().is_none_or(|n| n.peer_count() > 0);
     let sim = &mut host.sim;
     match sim.phase {
+        Phase::Lobby | Phase::Ended { .. } if keys.just_pressed(KeyCode::KeyM) => {
+            let next = match sim.mode {
+                GameMode::Standard => GameMode::Deathmatch,
+                GameMode::Deathmatch => GameMode::Standard,
+            };
+            sim.set_mode(next);
+        }
+        Phase::Lobby | Phase::Ended { .. } if keys.just_pressed(KeyCode::KeyV) => {
+            let next = match sim.map {
+                MapId::Day => MapId::Night,
+                MapId::Night => MapId::Day,
+            };
+            sim.set_map(next);
+        }
         Phase::Lobby => {
             if auto.0 && time.elapsed_secs() > 3.0 && peers_ready {
                 sim.start();
@@ -145,7 +165,7 @@ fn tick_session(
     mut session: ResMut<Session>,
     mut view: ResMut<View>,
     mut actions: ResMut<LocalActions>,
-    catch_hold: Res<CatchHold>,
+    trick: Res<LocalTrick>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
@@ -158,7 +178,7 @@ fn tick_session(
         Session::Host(host) => {
             let local = host.local;
             host.sim.set_pose(local, feet, yaw);
-            host.sim.set_catch_hold(local, catch_hold.0);
+            host.sim.set_trick(local, trick.0);
             for a in actions.0.drain(..) {
                 host.sim.apply(local, a);
             }
@@ -197,7 +217,7 @@ fn tick_session(
             for a in actions.0.drain(..) {
                 net.push_action(a);
             }
-            net.send_update(feet, yaw, catch_hold.0, now);
+            net.send_update(feet, yaw, trick.0, now);
             if net.receive(now) {
                 if let Some(s) = net.latest.as_mut() {
                     new_events = std::mem::take(&mut s.events);
@@ -226,6 +246,9 @@ fn tick_session(
             }
             GameEvent::Slimed { thrower, target } => {
                 format!("{} got SLIMED by {}!", view.name_of(target), view.name_of(thrower))
+            }
+            GameEvent::Stunned { thrower, target } => {
+                format!("{} got BRICKED by {}!", view.name_of(target), view.name_of(thrower))
             }
             GameEvent::BoomerangBack { owner } => format!("{}'s boomerang came back charged", view.name_of(owner)),
             GameEvent::MatchStarted => "Match started!".to_string(),

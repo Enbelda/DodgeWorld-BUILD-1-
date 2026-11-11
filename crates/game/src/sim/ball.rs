@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::layout::Aabb;
 
-/// The three kinds of ball in the arena.
+/// The kinds of ball in the arena.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum BallKind {
     Normal,
@@ -13,6 +13,23 @@ pub enum BallKind {
     Boomerang,
     /// Slimes whoever it hits: knocked to the nearest wall and stuck there.
     Slime,
+    /// Heavy red brick: big damage and knocks the target flat (stunned).
+    Brick,
+}
+
+impl BallKind {
+    /// Damage in half-hearts.
+    pub fn damage(self, powered: bool) -> u8 {
+        let base = match self {
+            BallKind::Brick => 4,
+            _ => 1,
+        };
+        if powered {
+            base * 2
+        } else {
+            base
+        }
+    }
 }
 
 pub const BALL_RADIUS: f32 = 0.3;
@@ -24,17 +41,24 @@ pub const MIN_THROW_SPEED: f32 = 20.0;
 pub const MAX_THROW_SPEED: f32 = 32.0;
 /// Extra speed for a ball that was just caught.
 pub const POWER_BONUS: f32 = 6.0;
-/// How much stronger curve and lob are than the original tuning (+30%).
-pub const EXAGGERATION: f32 = 1.3;
-/// Sideways acceleration at full curve, m/s^2.
-pub const CURVE_ACCEL: f32 = 26.0 * EXAGGERATION;
+/// Curved and lobbed throws fly this much faster (+30%)...
+pub const SPECIAL_SPEED: f32 = 1.3;
+/// ...and bend this much more (+40%) on top of the earlier +30% tuning.
+pub const SPECIAL_BEND: f32 = 1.4;
+/// Curve tuning before this round: 26 m/s^2 sideways, 0.22 rad launch offset, both x1.3.
+const PREV_CURVE_ACCEL: f32 = 26.0 * 1.3;
+const PREV_CURVE_OFFSET: f32 = 0.22 * 1.3;
+/// Sideways acceleration at full curve, m/s^2. Path bend goes with accel / speed^2, so the
+/// faster ball needs SPECIAL_SPEED^2 more accel to keep bending, times SPECIAL_BEND.
+pub const CURVE_ACCEL: f32 = PREV_CURVE_ACCEL * SPECIAL_BEND * SPECIAL_SPEED * SPECIAL_SPEED;
 /// How far a curved throw starts angled away from the aim (it bends back).
-pub const CURVE_LAUNCH_OFFSET: f32 = 0.22 * EXAGGERATION;
-/// Lob launch: horizontal speed and upward speed. Peak height scales with the square
-/// of the upward speed, so it gets sqrt(1.3) for a 30% higher arc.
-/// (Original lob: 14 m/s at 0.85 rad.)
-pub const LOB_FORWARD_SPEED: f32 = 9.2398;
-pub const LOB_UP_SPEED: f32 = 10.5179 * 1.140_175; // sqrt(EXAGGERATION)
+pub const CURVE_LAUNCH_OFFSET: f32 = PREV_CURVE_OFFSET * SPECIAL_BEND;
+/// Lob tuning before this round (14 m/s at 0.85 rad, arc height x1.3).
+const PREV_LOB_FORWARD: f32 = 9.2398;
+const PREV_LOB_UP: f32 = 10.5179 * 1.140_175;
+/// Lob launch: forward speed x1.3; arc height x1.4 (height goes with up-speed squared).
+pub const LOB_FORWARD_SPEED: f32 = PREV_LOB_FORWARD * SPECIAL_SPEED;
+pub const LOB_UP_SPEED: f32 = PREV_LOB_UP * 1.183_216; // sqrt(SPECIAL_BEND)
 /// How fast a locked-on throw turns toward its target, radians per second.
 pub const HOMING_RATE: f32 = 1.2;
 /// Speed of a boomerang flying back to its thrower.
@@ -65,9 +89,10 @@ pub fn launch(aim: Vec3, p: ThrowParams) -> (Vec3, f32) {
     if p.powered {
         speed += POWER_BONUS;
     }
-    // A curved ball starts angled away so it bends back toward the aim point.
+    // A curved ball flies faster and starts angled away so it bends back toward the aim.
     let right = aim.cross(Vec3::Y).normalize_or(Vec3::X);
     let curve = p.curve.clamp(-1.0, 1.0);
+    speed *= 1.0 + (SPECIAL_SPEED - 1.0) * curve.abs();
     let dir = (aim - right * curve * CURVE_LAUNCH_OFFSET).normalize();
     (dir * speed, curve)
 }
@@ -286,20 +311,49 @@ mod tests {
     }
 
     #[test]
-    fn curve_is_thirty_percent_stronger() {
-        assert!((CURVE_ACCEL - 26.0 * 1.3).abs() < 1e-4);
-        assert!((CURVE_LAUNCH_OFFSET - 0.22 * 1.3).abs() < 1e-4);
+    fn curved_throw_is_thirty_percent_faster() {
+        let (straight, _) = launch(Vec3::NEG_Z, throw(0.5, 0.0, false));
+        let (curved, _) = launch(Vec3::NEG_Z, throw(0.5, 1.0, false));
+        assert!((curved.length() / straight.length() - 1.3).abs() < 1e-4);
+    }
+
+    /// Sideways distance a full curve travels away from (and back to) the aim line.
+    fn max_side_offset(curve_accel_scale: f32, speed: f32, offset: f32) -> f32 {
+        let lat_v = speed * offset.sin();
+        let accel = PREV_CURVE_ACCEL * curve_accel_scale;
+        lat_v * lat_v / (2.0 * accel)
     }
 
     #[test]
-    fn lob_peak_is_thirty_percent_higher() {
-        // Original lob: 14 m/s at 0.85 rad -> upward speed 10.52 m/s.
-        let old_up = 14.0 * 0.85_f32.sin();
+    fn curve_bends_forty_percent_more_over_the_same_distance() {
+        // Path curvature ~ accel / speed^2 must grow by 1.4 even though the ball is 1.3x faster.
+        let old = PREV_CURVE_ACCEL / (26.0_f32 * 26.0);
+        let new = CURVE_ACCEL / (26.0_f32 * 1.3 * 26.0 * 1.3);
+        assert!((new / old - 1.4).abs() < 1e-3);
+        assert!((CURVE_LAUNCH_OFFSET / PREV_CURVE_OFFSET - 1.4).abs() < 1e-4);
+        // Sanity: the outward bulge is not absurd at full charge.
+        let bulge = max_side_offset(CURVE_ACCEL / PREV_CURVE_ACCEL, MAX_THROW_SPEED * 1.3, CURVE_LAUNCH_OFFSET);
+        assert!(bulge < 3.0, "bulge {bulge}");
+    }
+
+    #[test]
+    fn lob_is_faster_and_arcs_higher() {
         let (v, _) = launch(Vec3::NEG_Z, throw(0.0, 0.0, true));
-        let ratio = (v.y * v.y) / (old_up * old_up);
-        assert!((ratio - 1.3).abs() < 0.01, "peak height ratio {ratio}");
-        // Same forward speed as before.
-        assert!((Vec3::new(v.x, 0.0, v.z).length() - 14.0 * 0.85_f32.cos()).abs() < 0.01);
+        let fwd = Vec3::new(v.x, 0.0, v.z).length();
+        assert!((fwd / PREV_LOB_FORWARD - 1.3).abs() < 1e-3, "forward x1.3");
+        let height_ratio = (v.y * v.y) / (PREV_LOB_UP * PREV_LOB_UP);
+        assert!((height_ratio - 1.4).abs() < 0.01, "arc height x1.4: {height_ratio}");
+        // Peak stays under the 8 m walls when thrown from hand height.
+        let peak = 1.3 + v.y * v.y / (2.0 * FULL_GRAVITY);
+        assert!(peak < super::super::layout::WALL_HEIGHT, "peak {peak}");
+    }
+
+    #[test]
+    fn brick_and_powered_damage() {
+        assert_eq!(BallKind::Normal.damage(false), 1);
+        assert_eq!(BallKind::Normal.damage(true), 2);
+        assert_eq!(BallKind::Brick.damage(false), 4);
+        assert_eq!(BallKind::Slime.damage(false), 1);
     }
 
     #[test]

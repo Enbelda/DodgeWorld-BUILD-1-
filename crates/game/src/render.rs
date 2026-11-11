@@ -1,4 +1,4 @@
-//! Draws other players and the balls from the latest `View` snapshot.
+//! Draws other players (as humanoid rigs) and the balls from the latest `View` snapshot.
 
 use std::collections::HashMap;
 
@@ -6,34 +6,30 @@ use bevy::prelude::*;
 
 use crate::camera::FollowCamera;
 use crate::player::{LocalBody, LockOn, FEET_OFFSET};
+use crate::rig::{animate_rigs, make_rig_assets, spawn_rig, RigAssets};
 use crate::session::{SessionSet, View};
-use crate::sim::{ball::{BallKind, BALL_RADIUS}, BallState, PlayerId, Team, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT};
+use crate::sim::{ball::{BallKind, BALL_RADIUS}, BallState, PlayerId, Team, BODY_HEIGHT, HOLD_HEIGHT};
 
 /// Higher = snappier smoothing of remote positions.
 const SMOOTHING: f32 = 18.0;
 
 #[derive(Resource)]
 struct Palette {
-    body: [Handle<StandardMaterial>; 2],
-    visor: Handle<StandardMaterial>,
-    visor_catch: Handle<StandardMaterial>,
     ball_free: Handle<StandardMaterial>,
     ball_team: [Handle<StandardMaterial>; 2],
     ball_powered: Handle<StandardMaterial>,
-    /// Boomerang and slime balls: [resting, flying].
+    /// Boomerang, slime and brick: [resting, flying].
     ball_boomerang: [Handle<StandardMaterial>; 2],
     ball_slime: [Handle<StandardMaterial>; 2],
-    slimed_body: Handle<StandardMaterial>,
-    capsule: Handle<Mesh>,
-    visor_mesh: Handle<Mesh>,
+    ball_brick: [Handle<StandardMaterial>; 2],
     ball: Handle<Mesh>,
+    brick: Handle<Mesh>,
 }
 
+/// Another player: the root sits at their feet and turns with their facing.
 #[derive(Component)]
 struct Avatar {
     id: PlayerId,
-    body: Entity,
-    visor: Entity,
 }
 
 #[derive(Component)]
@@ -43,18 +39,18 @@ struct BallVis(usize);
 #[derive(Component)]
 struct LockMarker;
 
-/// Visor on the local body, so others' catch state reads the same way as ours.
-#[derive(Component)]
-struct LocalVisor;
-
 pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (make_palette, spawn_lock_marker))
+        app.init_resource::<crate::rig::LocalRigInput>()
+            .add_systems(Startup, (make_palette, make_rig_assets, spawn_lock_marker))
             // PostStartup: the local body is spawned during Startup.
-            .add_systems(PostStartup, add_local_visor)
-            .add_systems(Update, ((sync_avatars, sync_lock_marker).chain(), sync_local_body, sync_balls).after(SessionSet));
+            .add_systems(PostStartup, attach_local_rig)
+            .add_systems(
+                Update,
+                ((sync_avatars, sync_lock_marker).chain(), sync_local_body, sync_balls, animate_rigs).after(SessionSet),
+            );
     }
 }
 
@@ -66,11 +62,7 @@ fn make_palette(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut ma
     let emissive = |m: &mut Assets<StandardMaterial>, c: Color, glow: LinearRgba| {
         m.add(StandardMaterial { base_color: c, emissive: glow, ..default() })
     };
-    let half_segment = BODY_HEIGHT - 2.0 * BODY_RADIUS;
     commands.insert_resource(Palette {
-        body: [materials.add(Color::srgb(0.90, 0.25, 0.22)), materials.add(Color::srgb(0.22, 0.45, 0.95))],
-        visor: materials.add(Color::srgb(0.1, 0.1, 0.12)),
-        visor_catch: emissive(&mut materials, Color::srgb(1.0, 1.0, 0.6), LinearRgba::rgb(4.0, 4.0, 1.5)),
         ball_free: materials.add(Color::srgb(0.95, 0.95, 0.92)),
         ball_team: [
             emissive(&mut materials, Color::srgb(1.0, 0.3, 0.25), LinearRgba::rgb(3.0, 0.4, 0.3)),
@@ -85,21 +77,17 @@ fn make_palette(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>, mut ma
             materials.add(StandardMaterial { base_color: Color::srgb(0.35, 0.85, 0.3), perceptual_roughness: 0.15, ..default() }),
             emissive(&mut materials, Color::srgb(0.4, 1.0, 0.35), LinearRgba::rgb(0.8, 4.0, 0.6)),
         ],
-        slimed_body: emissive(&mut materials, Color::srgb(0.35, 0.85, 0.3), LinearRgba::rgb(0.2, 1.2, 0.15)),
-        capsule: meshes.add(Capsule3d::new(BODY_RADIUS, half_segment)),
-        visor_mesh: meshes.add(Cuboid::new(0.55, 0.18, 0.12)),
+        ball_brick: [
+            materials.add(StandardMaterial { base_color: Color::srgb(0.75, 0.12, 0.08), perceptual_roughness: 0.9, ..default() }),
+            emissive(&mut materials, Color::srgb(0.85, 0.15, 0.1), LinearRgba::rgb(2.5, 0.2, 0.1)),
+        ],
         ball: meshes.add(Sphere::new(BALL_RADIUS)),
+        brick: meshes.add(Cuboid::new(0.62, 0.3, 0.34)),
     });
 }
 
-fn add_local_visor(mut commands: Commands, palette: Res<Palette>, body: Single<Entity, With<LocalBody>>) {
-    commands.spawn((
-        LocalVisor,
-        Mesh3d(palette.visor_mesh.clone()),
-        MeshMaterial3d(palette.visor.clone()),
-        Transform::from_xyz(0.0, 0.55, -0.4),
-        ChildOf(*body),
-    ));
+fn attach_local_rig(mut commands: Commands, assets: Res<RigAssets>, body: Single<Entity, With<LocalBody>>) {
+    spawn_rig(&mut commands, &assets, *body, Vec3::NEG_Y * FEET_OFFSET, None);
 }
 
 fn smooth(dt: f32) -> f32 {
@@ -110,9 +98,8 @@ fn sync_avatars(
     mut commands: Commands,
     time: Res<Time>,
     view: Res<View>,
-    palette: Res<Palette>,
+    assets: Res<RigAssets>,
     mut avatars: Query<(Entity, &Avatar, &mut Transform, &mut Visibility)>,
-    mut mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
     let Some(snap) = view.snap.as_ref() else { return };
     let mut seen: HashMap<PlayerId, ()> = HashMap::new();
@@ -133,12 +120,6 @@ fn sync_avatars(
         }
         tf.rotation = tf.rotation.slerp(Quat::from_rotation_y(p.yaw), k);
         *vis = if p.alive() { Visibility::Inherited } else { Visibility::Hidden };
-        if let Ok(mut m) = mats.get_mut(av.body) {
-            m.0 = if p.slimed > 0.0 { palette.slimed_body.clone() } else { palette.body[team_index(p.team)].clone() };
-        }
-        if let Ok(mut m) = mats.get_mut(av.visor) {
-            m.0 = if p.catching { palette.visor_catch.clone() } else { palette.visor.clone() };
-        }
     }
 
     for p in &snap.players {
@@ -146,39 +127,28 @@ fn sync_avatars(
             continue;
         }
         let root = commands
-            .spawn((Transform::from_translation(Vec3::from_array(p.pos)), Visibility::default()))
-            .id();
-        let body = commands
             .spawn((
-                Mesh3d(palette.capsule.clone()),
-                MeshMaterial3d(palette.body[team_index(p.team)].clone()),
-                Transform::from_xyz(0.0, FEET_OFFSET, 0.0),
-                ChildOf(root),
+                Avatar { id: p.id },
+                Transform::from_translation(Vec3::from_array(p.pos)).with_rotation(Quat::from_rotation_y(p.yaw)),
+                Visibility::default(),
             ))
             .id();
-        let visor = commands
-            .spawn((
-                Mesh3d(palette.visor_mesh.clone()),
-                MeshMaterial3d(palette.visor.clone()),
-                Transform::from_xyz(0.0, FEET_OFFSET + 0.55, -0.4),
-                ChildOf(root),
-            ))
-            .id();
-        commands.entity(root).insert(Avatar { id: p.id, body, visor });
+        spawn_rig(&mut commands, &assets, root, Vec3::ZERO, Some(p.id));
     }
 }
 
 fn sync_local_body(
     view: Res<View>,
-    palette: Res<Palette>,
-    body: Single<(&mut MeshMaterial3d<StandardMaterial>, &mut Visibility), With<LocalBody>>,
-    visor: Single<&mut MeshMaterial3d<StandardMaterial>, (With<LocalVisor>, Without<LocalBody>)>,
+    charge: Res<crate::player::Charge>,
+    trick: Res<crate::session::LocalTrick>,
+    time: Res<Time>,
+    mut rig_input: ResMut<crate::rig::LocalRigInput>,
+    body: Single<&mut Visibility, With<LocalBody>>,
 ) {
+    rig_input.charge = charge.amount(time.elapsed_secs());
+    rig_input.trick = trick.0;
     let Some(me) = view.me() else { return };
-    let (mut mat, mut vis) = body.into_inner();
-    mat.0 = if me.slimed > 0.0 { palette.slimed_body.clone() } else { palette.body[team_index(me.team)].clone() };
-    *vis = if me.alive() { Visibility::Inherited } else { Visibility::Hidden };
-    visor.into_inner().0 = if me.catching { palette.visor_catch.clone() } else { palette.visor.clone() };
+    *body.into_inner() = if me.alive() { Visibility::Inherited } else { Visibility::Hidden };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -227,6 +197,7 @@ fn sync_balls(
             (BallKind::Normal, _) => palette.ball_free.clone(),
             (BallKind::Boomerang, _) => palette.ball_boomerang[flying as usize].clone(),
             (BallKind::Slime, _) => palette.ball_slime[flying as usize].clone(),
+            (BallKind::Brick, _) => palette.ball_brick[flying as usize].clone(),
         };
         // Shape cues: the boomerang is a spinning disc, slime is a wobbly blob.
         match b.kind {
@@ -239,14 +210,19 @@ fn sync_balls(
                 let w = 1.0 + 0.08 * (*spin * 9.0 + vis.0 as f32).sin();
                 tf.scale = Vec3::new(1.15 * w, 1.15 / w, 1.15 * w);
             }
+            // The brick tumbles end over end in flight and lies flat otherwise.
+            BallKind::Brick => {
+                tf.rotation = if flying { Quat::from_rotation_x(*spin * 2.5) } else { Quat::IDENTITY };
+            }
         }
     }
 
     for (i, b) in snap.balls.iter().enumerate() {
         if !have[i] {
+            let mesh = if b.kind == BallKind::Brick { palette.brick.clone() } else { palette.ball.clone() };
             commands.spawn((
                 BallVis(i),
-                Mesh3d(palette.ball.clone()),
+                Mesh3d(mesh),
                 MeshMaterial3d(palette.ball_free.clone()),
                 Transform::from_translation(Vec3::from_array(b.pos)),
             ));

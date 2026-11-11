@@ -12,6 +12,8 @@ usage: brawl_game [options]
   --port PORT        host port (default 47800)
   --name NAME        your display name
   --bind IP          host on this local address only (e.g. 127.0.0.1)
+  --deathmatch       start in deathmatch mode (no respawns)
+  --night            start on the night arena
   --autopilot        bot-driven local player, for automated play-tests";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,11 +31,13 @@ pub struct LaunchConfig {
     /// Host address to listen on; `None` = all interfaces.
     pub bind: Option<std::net::IpAddr>,
     pub autopilot: bool,
+    pub deathmatch: bool,
+    pub night: bool,
 }
 
 impl Default for LaunchConfig {
     fn default() -> Self {
-        LaunchConfig { mode: Mode::Host { lan: true }, name: "Player".into(), port: DEFAULT_PORT, bots: 1, bind: None, autopilot: false }
+        LaunchConfig { mode: Mode::Host { lan: true }, name: "Player".into(), port: DEFAULT_PORT, bots: 1, bind: None, autopilot: false, deathmatch: false, night: false }
     }
 }
 
@@ -60,6 +64,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchConfig, St
                 cfg.bots = n;
             }
             "--autopilot" => cfg.autopilot = true,
+            "--deathmatch" => cfg.deathmatch = true,
+            "--night" => cfg.night = true,
             "--bind" => {
                 let v = value("--bind")?;
                 cfg.bind = Some(v.parse().map_err(|_| format!("bad address: {v}"))?);
@@ -104,6 +110,12 @@ mod tests {
         assert_eq!(c.bind, Some([127, 0, 0, 1].into()));
         assert!(c.autopilot);
         assert!(p("--bind nope").is_err());
+    }
+
+    #[test]
+    fn mode_and_map_flags() {
+        let c = p("--deathmatch --night").unwrap();
+        assert!(c.deathmatch && c.night);
     }
 
     #[test]

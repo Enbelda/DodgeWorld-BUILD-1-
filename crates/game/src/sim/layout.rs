@@ -6,7 +6,7 @@ use super::ball::BallKind;
 
 /// Half the width/length of the square play area, in metres.
 pub const ARENA_HALF: f32 = 20.0;
-pub const WALL_HEIGHT: f32 = 6.0;
+pub const WALL_HEIGHT: f32 = 8.0;
 pub const WALL_THICKNESS: f32 = 1.0;
 
 /// Axis-aligned box.
@@ -71,6 +71,7 @@ pub fn ball_pads() -> Vec<(Vec3, BallKind)> {
         (Vec3::new(0.0, 0.3, 3.0), BallKind::Normal),
         (Vec3::new(-13.0, 0.3, 0.0), BallKind::Boomerang),
         (Vec3::new(13.0, 0.3, 0.0), BallKind::Slime),
+        (Vec3::new(0.0, 0.3, 0.0), BallKind::Brick),
     ]
 }
 

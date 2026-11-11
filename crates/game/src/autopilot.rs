@@ -1,12 +1,13 @@
 //! `--autopilot`: drives the local player through the normal client path (move intent,
 //! camera yaw, queued actions) so the real app can be play-tested without a human.
-//! It cycles through straight, curved and lobbed throws and tries to catch.
+//! It cycles through straight, curved and lobbed throws, times catches, and every few
+//! seconds does a double-jump flip or an air spin.
 
 use bevy::prelude::*;
 
 use crate::camera::FollowCamera;
-use crate::player::{Autopilot, LocalBody, LockOn, MoveIntent, FEET_OFFSET};
-use crate::session::{CatchHold, LocalActions, View};
+use crate::player::{Autopilot, LocalBody, LockOn, MoveIntent, Side, FEET_OFFSET};
+use crate::session::{LocalActions, View};
 use crate::sim::{bot::yaw_toward, Action, BallState, HOLD_HEIGHT};
 
 const THROW_EVERY: f32 = 1.4;
@@ -21,6 +22,10 @@ pub struct AutoState {
     was_incoming: bool,
     strafe_timer: f32,
     strafe: f32,
+    /// Trick routine: counts down to the next one; `trick_step` walks through its inputs.
+    trick_timer: f32,
+    trick_step: u32,
+    tricks: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -32,7 +37,6 @@ pub fn drive(
     mut cam: Single<&mut FollowCamera>,
     mut intent: ResMut<MoveIntent>,
     mut actions: ResMut<LocalActions>,
-    mut catch_hold: ResMut<CatchHold>,
     mut lock: ResMut<LockOn>,
     mut st: Local<AutoState>,
 ) {
@@ -41,7 +45,6 @@ pub fn drive(
     }
     let dt = time.delta_secs();
     *intent = MoveIntent::default();
-    catch_hold.0 = false;
     let (Some(snap), Some(me)) = (view.snap.as_ref(), view.me()) else { return };
     if !me.alive() {
         return;
@@ -69,22 +72,25 @@ pub fn drive(
     let incoming = snap.balls.iter().find_map(|b| match b.state {
         BallState::Live { team, .. } if team != me.team => {
             let p = Vec3::from_array(b.pos);
-            (p.distance(chest) < 7.0).then_some(p)
+            let speed = Vec3::from_array(b.vel).length().max(1.0);
+            (p.distance(chest) < 7.0).then_some((p, p.distance(chest) / speed))
         }
         _ => None,
     });
-    // Every other incoming ball: hold catch early and let it arrive.
+    // Every other incoming ball: press catch just before it arrives.
     if incoming.is_some() && !st.was_incoming {
         st.caught_attempts += 1;
-        if st.caught_attempts % 2 == 1 && !me.holding {
-            info!("autopilot: holding catch");
-        }
     }
     st.was_incoming = incoming.is_some();
-    if let Some(p) = incoming {
+    let incoming = incoming.map(|(p, eta)| {
         cam.yaw = yaw_toward(Vec3::new(p.x - feet.x, 0.0, p.z - feet.z));
-        catch_hold.0 = !me.holding && st.caught_attempts % 2 == 1;
-    }
+        let go = st.caught_attempts % 2 == 1;
+        if go && eta < 0.25 && !me.holding && !me.catching && me.catch_cooldown <= 0.0 {
+            info!("autopilot: timed catch");
+            actions.0.push(Action::Catch);
+        }
+        p
+    });
 
     let goal = if me.holding {
         enemy.map(|e| {
@@ -117,6 +123,25 @@ pub fn drive(
         }
     }
     st.last_pos = Some(feet);
+
+    // Every few seconds: double-jump flip, or jump + Q/E spin, alternating.
+    st.trick_timer -= dt;
+    if st.trick_timer <= 0.0 && incoming.is_none() {
+        let spin = st.tricks % 2 == 1;
+        match st.trick_step {
+            0 => intent.jump = true,
+            8 if spin => intent.trick = Some(if st.tricks % 4 == 1 { Side::Left } else { Side::Right }),
+            8 => intent.jump = true, // second jump: automatic flip
+            _ => {}
+        }
+        st.trick_step += 1;
+        if st.trick_step > 30 {
+            info!("autopilot: did {}", if spin { "air spin" } else { "double-jump flip" });
+            st.trick_step = 0;
+            st.tricks += 1;
+            st.trick_timer = 4.0;
+        }
+    }
 
     if me.holding {
         if let Some(e) = enemy {
