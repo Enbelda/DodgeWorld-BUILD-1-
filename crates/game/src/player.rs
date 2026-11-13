@@ -7,6 +7,10 @@
 //! Right Mouse to catch (time it).
 //! Cover (see `cover.rs`): F next to a waist-high wall to crouch behind it, A/D to slide,
 //! charge to rise and throw over it; F again or sprint, jump or dash to leave.
+//! Mounts (see `ride.rs`, `mounts.rs`): 1-6 hop on a skateboard, longboard, BMX, inline
+//! skates, scooter or soap shoes (same key or X hops off). Riding: WASD carve / push / brake,
+//! Space ollie, in the air Q + keys flip trick, E + keys grab, R + W/S front/back flip;
+//! hold F coming down onto a rail or ledge to grind. Throwing and catching still work.
 //! Parkour (see `parkour.rs`): run along a tall wall in the air to wall run, push into it to
 //! climb, grab ledges at hand height, Space to climb up / jump off, Ctrl to let go.
 //! In the air: Q / E spin the body 180 left / right (the camera stays put); W+Q/E front flip,
@@ -20,6 +24,8 @@ use bevy::input::mouse::AccumulatedMouseMotion;
 
 use crate::camera::{CameraShake, CursorLocked, FollowCamera};
 use crate::cover::{self, Cover};
+use crate::mounts::{Dir, MountKind, MountLibrary, TrickInput};
+use crate::ride::{Ride, RideEvent, RideInput};
 use crate::parkour::{self, Drive, Parkour};
 use crate::session::{LocalActions, LocalTrick, View};
 use crate::sim::bot::yaw_toward;
@@ -91,6 +97,9 @@ pub struct LocalBody {
     pub jump_buffer: f32,
     /// Mid-dash last frame (to carry momentum out of it).
     pub was_dashing: bool,
+    /// Riding: this frame's velocity, or where to put the feet (grinding).
+    pub ride_vel: Vec3,
+    pub ride_place: Option<Vec3>,
 }
 
 /// The local player's cover state.
@@ -109,7 +118,20 @@ pub struct LocalCover {
 pub struct LocalArena {
     pub arena: Option<ArenaId>,
     pub solids: Vec<layout::Aabb>,
+    /// Rails and ledges to grind.
+    pub rails: Vec<layout::Rail>,
 }
+
+/// The local player's mount, and recent trick messages for the HUD.
+#[derive(Resource, Default)]
+pub struct LocalRide {
+    pub ride: Option<Ride>,
+    /// (time, message), newest last.
+    pub feed: Vec<(f32, String)>,
+}
+
+/// Landed combos worth this much are reported to the host (feed, ball charge).
+pub const STYLE_REPORT_POINTS: u32 = 300;
 
 /// Seconds since the mouse last moved (lets the mouse override lock-on camera pull).
 #[derive(Resource, Default)]
@@ -145,6 +167,16 @@ pub struct MoveIntent {
     pub cover: bool,
     /// Charging a throw (stands up in cover).
     pub aiming: bool,
+    /// 1-6 pressed: ride that mount (or hop off it); X: hop off.
+    pub mount: Option<MountKind>,
+    pub dismount: bool,
+    /// Riding: raw WASD + Shift for picking tricks, and the trick buttons.
+    pub trick_keys: TrickInput,
+    pub trick_flip: bool,
+    pub trick_grab_start: bool,
+    pub trick_grab: bool,
+    pub trick_grind: bool,
+    pub trick_air_flip: bool,
 }
 
 /// How far the body is turned away from the camera's yaw (a spin turns the body only).
@@ -266,6 +298,7 @@ impl Plugin for PlayerPlugin {
             .init_resource::<LocalCover>()
             .init_resource::<LocalArena>()
             .init_resource::<MouseAim>()
+            .init_resource::<LocalRide>()
             .add_systems(Startup, spawn_local_body)
             .add_systems(
                 Update,
@@ -457,6 +490,7 @@ fn track_arena(view: Res<View>, mut local: ResMut<LocalArena>) {
     if local.arena != Some(arena) {
         local.arena = Some(arena);
         local.solids = layout::solids(arena);
+        local.rails = layout::rails(arena);
     }
 }
 
@@ -561,6 +595,24 @@ fn keyboard_intent(
     let charging = mouse.pressed(MouseButton::Left);
     intent.aiming = charging;
     intent.cover = keys.just_pressed(KeyCode::KeyF) && !charging;
+    // Mount keys and riding tricks (Q/E/F belong to the throw while charging).
+    let digits = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5, KeyCode::Digit6];
+    intent.mount = digits.iter().position(|k| keys.just_pressed(*k)).map(|i| MountKind::ALL[i]);
+    intent.dismount = keys.just_pressed(KeyCode::KeyX);
+    intent.trick_keys = TrickInput {
+        dir: Dir::from_keys(
+            keys.pressed(KeyCode::KeyW),
+            keys.pressed(KeyCode::KeyS),
+            keys.pressed(KeyCode::KeyA),
+            keys.pressed(KeyCode::KeyD),
+        ),
+        shift: intent.sprint,
+    };
+    intent.trick_flip = keys.just_pressed(KeyCode::KeyQ) && !charging;
+    intent.trick_grab_start = keys.just_pressed(KeyCode::KeyE) && !charging;
+    intent.trick_grab = keys.pressed(KeyCode::KeyE) && !charging;
+    intent.trick_grind = keys.pressed(KeyCode::KeyF) && !charging;
+    intent.trick_air_flip = keys.just_pressed(KeyCode::KeyR);
     intent.trick = match (keys.just_pressed(KeyCode::KeyQ), keys.just_pressed(KeyCode::KeyE)) {
         (true, false) if !charging => Some(Side::Left),
         (false, true) if !charging => Some(Side::Right),
@@ -580,6 +632,9 @@ pub fn move_local_body(
     mut cover: ResMut<LocalCover>,
     mut shake: ResMut<CameraShake>,
     arena: Res<LocalArena>,
+    mut ride: ResMut<LocalRide>,
+    lib: Res<MountLibrary>,
+    mut actions: ResMut<LocalActions>,
     cam: Single<&FollowCamera>,
     body: Single<(
         &mut LocalBody,
@@ -612,6 +667,7 @@ pub fn move_local_body(
         dash.active = 0.0;
         parkour.0.reset();
         cover.cover = None;
+        ride.ride = None;
         return;
     }
     // Slimed, knocked flat or launched: the host owns our position.
@@ -623,6 +679,9 @@ pub fn move_local_body(
         }
         parkour.0.reset();
         cover.cover = None;
+        if ride.ride.take().is_some() {
+            info!("mount: knocked off");
+        }
         b.push = Vec3::ZERO;
         b.recoil = Vec3::ZERO;
         let target = Vec3::from_array(m.pos) + Vec3::Y * FEET_OFFSET;
@@ -648,6 +707,45 @@ pub fn move_local_body(
         b.recoil = Vec3::ZERO;
     }
     let feet = tf.translation - Vec3::Y * FEET_OFFSET;
+
+    // 1-6: hop on that mount (the same key again, or X, hops off).
+    let now = time.elapsed_secs();
+    if let Some(kind) = intent.mount {
+        if ride.ride.as_ref().is_some_and(|r| r.mount == kind) {
+            ride.ride = None;
+            info!("mount: hopped off");
+        } else {
+            let heading = facing.body_yaw(cam.yaw);
+            let speed = ride.ride.as_ref().map_or(0.0, |r| r.speed);
+            ride.ride = Some(Ride::new(kind, heading, speed));
+            cover.cover = None;
+            parkour.0.reset();
+            trick.0 = None;
+            let name = lib.get(kind).name.clone();
+            info!("mount: riding the {name}");
+            ride.feed.push((now, format!("Riding the {name}")));
+        }
+    }
+    if intent.dismount && ride.ride.take().is_some() {
+        info!("mount: hopped off");
+    }
+    if ride.ride.is_some() {
+        ride_frame(&intent, &lib, &arena, output, feet, grounded, dt, now, recoil, &mut ride, &mut dash, &mut b, &mut actions);
+        if let Some(r) = ride.ride.as_ref() {
+            // The body faces the way it rolls.
+            let want = r.heading - cam.yaw;
+            facing.0 = lerp_angle(facing.0, want, 1.0 - (-20.0 * dt).exp());
+            tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
+        }
+        match b.ride_place.take() {
+            Some(p) => {
+                tf.translation = p + Vec3::Y * FEET_OFFSET;
+                controller.translation = None;
+            }
+            None => controller.translation = Some(b.ride_vel * dt),
+        }
+        return;
+    }
 
     // F: take cover behind the wall we're next to, or leave it.
     if intent.cover {
@@ -806,6 +904,91 @@ pub fn move_local_body(
     controller.translation = Some(Vec3::new(flat.x, b.vel_y, flat.z) * dt);
 }
 
+/// One frame on a mount: dashes still work; otherwise the ride logic moves us. Leaves the
+/// result in `b.ride_vel` / `b.ride_place`.
+#[allow(clippy::too_many_arguments)]
+fn ride_frame(
+    intent: &MoveIntent,
+    lib: &MountLibrary,
+    arena: &LocalArena,
+    output: Option<&KinematicCharacterControllerOutput>,
+    feet: Vec3,
+    grounded: bool,
+    dt: f32,
+    now: f32,
+    recoil: Vec3,
+    ride: &mut LocalRide,
+    dash: &mut LocalDash,
+    b: &mut LocalBody,
+    actions: &mut LocalActions,
+) {
+    let Some(r) = ride.ride.as_mut() else { return };
+    b.ride_place = None;
+    if intent.dash {
+        let dir = if intent.dir.length_squared() > 0.01 { intent.dir } else { crate::ride::heading_dir(r.heading) };
+        if dash.try_start(dir, intent.sprint) {
+            r.trick = None;
+            r.grind = None;
+        }
+    }
+    if dash.dashing() {
+        b.vel_y = 0.0;
+        b.ride_vel = dash.velocity + recoil;
+        return;
+    }
+    // Ran into something: lose the speed we couldn't make.
+    if let Some(o) = output {
+        let want = o.desired_translation.with_y(0.0).length();
+        if want > 1e-3 && r.grind.is_none() {
+            let eff = o.effective_translation.with_y(0.0);
+            let got = eff.length();
+            if got < want * 0.7 {
+                r.blocked(r.speed * got / want);
+                // Glance off along the wall instead of grinding to a halt against it.
+                if got > want * 0.15 {
+                    r.heading = yaw_toward(eff);
+                }
+            }
+        }
+    }
+    let def = lib.get(r.mount);
+    let input = RideInput {
+        dir: intent.dir.normalize_or_zero(),
+        keys: intent.trick_keys,
+        sprint: intent.sprint,
+        jump: intent.jump,
+        flip: intent.trick_flip,
+        grab_start: intent.trick_grab_start,
+        grab: intent.trick_grab,
+        grind: intent.trick_grind,
+        air_flip: intent.trick_air_flip,
+        grounded,
+    };
+    let out = r.update(def, &input, &mut b.vel_y, feet, dt, &arena.rails);
+    b.ride_vel = out.vel + recoil;
+    b.ride_place = out.place;
+    for e in out.events {
+        let msg = match e {
+            RideEvent::Trick(n) => n,
+            RideEvent::Grind(n) => format!("{n} (grind)"),
+            RideEvent::Landed { names, points } => {
+                if points >= STYLE_REPORT_POINTS {
+                    actions.0.push(Action::Style { points });
+                }
+                format!("LANDED {} = {points}", names.join(" + "))
+            }
+            RideEvent::Bail(why) => format!("BAIL! {why}"),
+        };
+        info!("ride: {msg}");
+        ride.feed.push((now, msg));
+    }
+    ride.feed.retain(|(t, _)| now - t < 4.0);
+    let len = ride.feed.len();
+    if len > 5 {
+        ride.feed.drain(..len - 5);
+    }
+}
+
 /// Speed multiplier: sprinting runs 1.4x; a jump taken while sprinting carries 1.24x farther.
 pub fn move_multiplier(sprint: bool, sprint_jump: bool) -> f32 {
     match (sprint, sprint_jump) {
@@ -847,7 +1030,7 @@ fn combat_input(
     mut actions: ResMut<LocalActions>,
     mut cover: ResMut<LocalCover>,
     mut shake: ResMut<CameraShake>,
-    arena: Res<LocalArena>,
+    (arena, ride): (Res<LocalArena>, Res<LocalRide>),
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&Transform, (With<FollowCamera>, Without<LocalBody>)>,
     follow: Single<&FollowCamera>,
@@ -897,7 +1080,8 @@ fn combat_input(
     }
 
     // F lobs (while charging, or when it wasn't used to take / leave cover).
-    if keys.just_pressed(KeyCode::KeyF) && (charge.started.is_some() || !cover.toggled) {
+    // (Riding, F is the grind button: it only lobs while charging.)
+    if keys.just_pressed(KeyCode::KeyF) && (charge.started.is_some() || (!cover.toggled && ride.ride.is_none())) {
         actions.0.push(Action::Throw { aim, charge: 0.0, curve: 0.0, lob: true });
         charge.started = None;
         release_lock(&mut lock, &mut actions);

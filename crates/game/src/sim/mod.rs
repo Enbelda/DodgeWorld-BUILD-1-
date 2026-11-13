@@ -8,6 +8,7 @@ pub mod layout;
 use bevy::math::Vec3;
 use serde::{Deserialize, Serialize};
 
+use crate::mounts::{MountKind, TrickCat};
 use ball::{BallKind, ThrowParams, BALL_RADIUS};
 pub use layout::ArenaId;
 use layout::Aabb;
@@ -40,6 +41,10 @@ pub const CATCH_PUSH_SCALE: f32 = 0.22;
 pub const CATCH_PUSH_MAX: f32 = 9.0;
 /// How quickly a catch's push-back fades (per second).
 pub const RECOIL_DECAY: f32 = 6.0;
+/// Landing a trick combo worth this much while holding a ball charges it (full power).
+pub const STYLE_CHARGE_POINTS: u32 = 1000;
+/// Combos worth at least this much show up in the feed.
+pub const STYLE_FEED_POINTS: u32 = 500;
 /// Where a held ball sits relative to the holder's feet.
 pub const HOLD_HEIGHT: f32 = 1.3;
 /// The ball must come at the catcher's front half to be caught.
@@ -98,6 +103,8 @@ pub enum Action {
     Catch,
     /// Lock on to an enemy (or clear the lock).
     Lock { target: Option<PlayerId> },
+    /// Landed a trick combo worth `points` on a mount.
+    Style { points: u32 },
 }
 
 /// Standard: knocked-out players respawn, first team to `KO_TARGET` wins.
@@ -158,6 +165,37 @@ pub enum CoverPose {
     Up,
 }
 
+/// What a rider is on and doing, reported by the client so others can draw it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub struct RideView {
+    pub mount: MountKind,
+    /// Trick in progress: kind, index in the mount's list, progress (1 = done).
+    pub trick: Option<(TrickCat, u8, f32)>,
+    /// Grind in progress (index in the mount's grinds).
+    pub grind: Option<u8>,
+    /// Off balance after a bail.
+    pub bail: bool,
+    pub speed: f32,
+    /// Pushing / striding animation phase.
+    pub push: f32,
+}
+
+impl RideView {
+    /// Clamp what a client sent to sane values.
+    pub fn sanitized(self) -> Option<RideView> {
+        let ok = |v: f32| v.is_finite();
+        if !ok(self.speed) || !ok(self.push) || self.trick.is_some_and(|t| !ok(t.2)) {
+            return None;
+        }
+        Some(RideView {
+            speed: self.speed.clamp(0.0, 40.0),
+            push: self.push % 1000.0,
+            trick: self.trick.map(|(c, i, p)| (c, i, p.clamp(0.0, 4.0))),
+            ..self
+        })
+    }
+}
+
 /// A slimed player is dragged to `anchor` on the nearest wall and held there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slime {
@@ -201,6 +239,8 @@ pub struct Player {
     pub cover: CoverPose,
     /// Push-back from a catch (bots only; clients move their own body).
     pub recoil: Vec3,
+    /// Riding a mount (reported by the client).
+    pub ride: Option<RideView>,
     /// Bumped on every hit taken, so clients can flash the model.
     pub hits: u32,
     /// > 0 while knocked out.
@@ -308,6 +348,8 @@ pub enum GameEvent {
     Slimed { thrower: PlayerId, target: PlayerId },
     Stunned { thrower: PlayerId, target: PlayerId },
     BoomerangBack { owner: PlayerId },
+    /// A big trick combo; `charged` when it charged the ball in hand.
+    Combo { player: PlayerId, points: u32, charged: bool },
     MatchStarted,
     MatchEnded { winner: Team },
 }
@@ -404,6 +446,7 @@ impl Match {
             parkour: ParkourPose::None,
             cover: CoverPose::None,
             recoil: Vec3::ZERO,
+            ride: None,
             hits: 0,
             respawn_timer: 0.0,
             teleports: 0,
@@ -471,6 +514,13 @@ impl Match {
     pub fn set_parkour(&mut self, id: PlayerId, pose: ParkourPose) {
         if let Some(p) = self.player_mut(id) {
             p.parkour = pose;
+        }
+    }
+
+    /// A client reports what it is riding (if anything).
+    pub fn set_ride(&mut self, id: PlayerId, ride: Option<RideView>) {
+        if let Some(p) = self.player_mut(id) {
+            p.ride = if p.alive() { ride.and_then(RideView::sanitized) } else { None };
         }
     }
 
@@ -696,6 +746,16 @@ impl Match {
             Action::Lock { target } => {
                 let team = self.players[pi].team;
                 self.players[pi].lock = target.filter(|t| self.valid_lock(team, *t));
+            }
+            Action::Style { points } => {
+                let p = &mut self.players[pi];
+                let charged = points >= STYLE_CHARGE_POINTS && p.holding.is_some() && !p.charged;
+                if charged {
+                    p.charged = true;
+                }
+                if points >= STYLE_FEED_POINTS {
+                    self.events.push(GameEvent::Combo { player: id, points, charged });
+                }
             }
         }
     }
@@ -1197,6 +1257,7 @@ impl Match {
                     trick: p.trick,
                     parkour: if p.alive() && !p.helpless() { p.parkour } else { ParkourPose::None },
                     cover: if p.alive() && !p.helpless() { p.cover } else { CoverPose::None },
+                    ride: if p.alive() { p.ride } else { None },
                     hits: p.hits,
                     catch_cooldown: p.catch_cooldown,
                     respawn_timer: p.respawn_timer.max(0.0),
@@ -1275,6 +1336,7 @@ pub struct PlayerView {
     pub trick: Option<TrickState>,
     pub parkour: ParkourPose,
     pub cover: CoverPose,
+    pub ride: Option<RideView>,
     pub hits: u32,
     pub respawn_timer: f32,
     pub teleports: u32,
@@ -2007,5 +2069,33 @@ mod tests {
         let bytes = bincode::serialize(&s).unwrap();
         let back: Snapshot = bincode::deserialize(&bytes).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn a_big_combo_charges_the_ball_in_hand() {
+        let (mut m, red, _blue) = duel();
+        let ri = m.players.iter().position(|p| p.id == red).unwrap();
+        m.players[ri].holding = None;
+        m.balls[0].state = BallState::Free;
+        m.apply(red, Action::Style { points: 1500 });
+        assert!(!m.players[ri].charged, "no ball, nothing to charge");
+        assert!(m.events.iter().any(|e| matches!(e, GameEvent::Combo { points: 1500, charged: false, .. })));
+        m.players[ri].holding = Some(0);
+        m.balls[0].state = BallState::Held { by: red };
+        m.apply(red, Action::Style { points: 600 });
+        assert!(!m.players[ri].charged, "too small");
+        m.apply(red, Action::Style { points: 1200 });
+        assert!(m.players[ri].charged);
+        assert!(m.events.iter().any(|e| matches!(e, GameEvent::Combo { charged: true, .. })));
+    }
+
+    #[test]
+    fn ride_reports_are_sanitized() {
+        let (mut m, red, _) = duel();
+        let v = RideView { mount: MountKind::Bmx, trick: Some((TrickCat::Flip, 2, 0.5)), grind: None, bail: false, speed: 999.0, push: 1.0 };
+        m.set_ride(red, Some(v));
+        assert_eq!(m.snapshot().players.iter().find(|p| p.id == red).unwrap().ride.unwrap().speed, 40.0);
+        m.set_ride(red, Some(RideView { speed: f32::NAN, ..v }));
+        assert!(m.player(red).unwrap().ride.is_none());
     }
 }

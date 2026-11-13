@@ -19,7 +19,8 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use bevy::prelude::*;
 
-use crate::sim::{GameEvent, ParkourPose, PlayerId, PlayerView, Team, TrickKind, TrickState};
+use crate::mounts::{Hand, Legs, MountKind, MountLibrary, Spot, Stance, TrickAnim, TrickCat};
+use crate::sim::{GameEvent, ParkourPose, PlayerId, PlayerView, RideView, Team, TrickKind, TrickState};
 use crate::textures::Textures;
 
 /// Height of the hip/flip pivot above the feet. Flips rotate the body around it.
@@ -94,8 +95,18 @@ struct Anim {
 #[derive(Component)]
 pub struct Rig {
     pub player: Option<PlayerId>,
-    flip: Entity,
-    joints: [Entity; JOINTS],
+    pub(crate) flip: Entity,
+    pub(crate) joints: [Entity; JOINTS],
+    /// Where the rig's root sits under its parent (the feet).
+    pub(crate) offset: Vec3,
+    /// The mount model, while riding.
+    pub(crate) mount: Option<crate::mount_vis::MountAttach>,
+    /// This frame's riding pose and the body numbers the mount model follows.
+    pub(crate) ride: Option<RidePose>,
+    pub(crate) pose_drop: f32,
+    pub(crate) pose_lunge: f32,
+    pub(crate) pose_lift: f32,
+    pub(crate) pose_yaw: f32,
     /// (joint, hand 0 = left / 1 = right, bone).
     fingers: Vec<(Entity, usize, FingerBone)>,
     parts: Vec<(Entity, Part)>,
@@ -111,7 +122,53 @@ impl Rig {
     pub fn cradling(&self) -> bool {
         self.anim.catch_t < CATCH_ANIM_SECS * 0.8
     }
+    /// The ankle joint of leg 0 (left) / 1 (right): skates and soap shoes attach here.
+    pub fn ankle(&self, side: usize) -> Entity {
+        self.joints[L_ANKLE + side.min(1)]
+    }
 }
+
+/// How a rider looks this frame: the mount's stance, the trick in progress (with its
+/// animation from the data files and progress 0..1), the grind, pushing phase, bail.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RidePose {
+    pub kind: MountKind,
+    pub stance: Stance,
+    pub trick: Option<(TrickCat, TrickAnim, f32)>,
+    pub grind: Option<TrickAnim>,
+    pub push: f32,
+    pub speed: f32,
+    pub bail: bool,
+}
+
+/// Turn what the network says a rider is doing into a pose, using the trick data.
+pub fn ride_pose(v: &RideView, lib: &MountLibrary) -> RidePose {
+    let def = lib.get(v.mount);
+    RidePose {
+        kind: v.mount,
+        stance: def.stance,
+        trick: v.trick.and_then(|(cat, i, p)| def.trick(cat, i as usize).map(|t| (cat, t.anim, p))),
+        grind: v.grind.and_then(|i| def.trick(TrickCat::Grind, i as usize)).map(|t| t.anim),
+        push: v.push,
+        speed: v.speed,
+        bail: v.bail,
+    }
+}
+
+/// How high the rider stands above the ground on each mount (deck, pedals, wheels).
+pub fn ride_lift(kind: MountKind) -> f32 {
+    match kind {
+        MountKind::Skateboard => 0.11,
+        MountKind::Longboard => 0.14,
+        MountKind::Bmx => 0.3,
+        MountKind::Scooter => 0.1,
+        MountKind::InlineSkates => 0.1,
+        MountKind::SoapShoes => 0.015,
+    }
+}
+
+/// Side-on stance: the rider faces 90 degrees right of travel, left foot forward.
+pub const SIDEWAYS_YAW: f32 = -FRAC_PI_2;
 
 /// Extra local-only inputs: throw charge and the trick we are doing right now.
 #[derive(Resource, Default)]
@@ -387,7 +444,21 @@ pub fn spawn_rig(commands: &mut Commands, a: &RigAssets, parent: Entity, offset:
         joints[L_ANKLE + side] = ankle;
     }
     let parts = b.parts;
-    commands.entity(root).insert(Rig { player, flip, joints, fingers, parts, anim: Anim::default() });
+    commands.entity(root).insert(Rig {
+        player,
+        flip,
+        joints,
+        offset,
+        mount: None,
+        ride: None,
+        pose_drop: 0.0,
+        pose_lunge: 0.0,
+        pose_lift: 0.0,
+        pose_yaw: 0.0,
+        fingers,
+        parts,
+        anim: Anim::default(),
+    });
     root
 }
 
@@ -413,6 +484,8 @@ pub struct PoseInput {
     pub catch_t: f32,
     /// Crouched behind cover.
     pub crouch: bool,
+    /// Riding a mount.
+    pub ride: Option<RidePose>,
 }
 
 /// Joint angles: (pitch about X, roll about Z). Positive shoulder pitch raises the arm forward;
@@ -432,6 +505,10 @@ pub struct Pose {
     /// How far the hips move forward (-Z) of the feet: stepping into a throw, or shoved
     /// back by a catch (negative).
     pub lunge: f32,
+    /// Turn of the whole body about Y (side-on stance, spins on a mount).
+    pub body_yaw: f32,
+    /// Raised off the ground (standing on a deck, pedals or skates).
+    pub lift: f32,
     /// How closed each hand is: 0 open and spread, 1 a fist. [left, right].
     pub grip: [f32; 2],
 }
@@ -672,6 +749,11 @@ pub fn pose(i: &PoseInput) -> Pose {
         ParkourPose::None => {}
     }
 
+    if let Some(r) = i.ride {
+        ride_body(&mut p, r, i.time, right_busy);
+    }
+    let j = &mut p.joints;
+
     if let Some(t) = i.trick {
         let tuck = (t.progress * PI).sin();
         match t.kind {
@@ -729,6 +811,209 @@ pub fn pose(i: &PoseInput) -> Pose {
     p
 }
 
+/// Leg shapes for tricks, blended in by `w`.
+fn trick_legs(p: &mut Pose, legs: Legs, w: f32) {
+    let j = &mut p.joints;
+    let set = |j: &mut [(f32, f32); JOINTS], k: usize, v: (f32, f32)| {
+        j[k] = (lerp(j[k].0, v.0, w), lerp(j[k].1, v.1, w));
+    };
+    match legs {
+        Legs::Normal => {}
+        Legs::Tuck => {
+            set(j, L_HIP, (1.3, -0.15));
+            set(j, R_HIP, (1.3, 0.15));
+            set(j, L_KNEE, (-2.0, 0.0));
+            set(j, R_KNEE, (-2.0, 0.0));
+        }
+        Legs::Extend => {
+            set(j, L_HIP, (0.25, -0.1));
+            set(j, R_HIP, (0.25, 0.1));
+            set(j, L_KNEE, (0.0, 0.0));
+            set(j, R_KNEE, (0.0, 0.0));
+            set(j, L_ANKLE, (-0.4, 0.0));
+            set(j, R_ANKLE, (-0.4, 0.0));
+        }
+        Legs::Kick => {
+            set(j, L_HIP, (1.1, -0.2));
+            set(j, L_KNEE, (-1.5, 0.0));
+            set(j, R_HIP, (-0.7, 0.15));
+            set(j, R_KNEE, (-0.1, 0.0));
+        }
+        Legs::OneFoot => {
+            set(j, R_HIP, (-0.3, 0.8));
+            set(j, R_KNEE, (-0.1, 0.0));
+        }
+        Legs::Split => {
+            set(j, L_HIP, (0.9, -0.15));
+            set(j, R_HIP, (-0.9, 0.15));
+            set(j, L_KNEE, (-0.2, 0.0));
+            set(j, R_KNEE, (-0.2, 0.0));
+        }
+        Legs::Cross => {
+            set(j, L_HIP, (0.45, 0.35));
+            set(j, R_HIP, (0.45, -0.35));
+            set(j, L_KNEE, (-0.8, 0.0));
+            set(j, R_KNEE, (-0.8, 0.0));
+        }
+    }
+}
+
+/// Riding: the stance for the mount, then the trick or grind from the data on top.
+fn ride_body(p: &mut Pose, r: RidePose, time: f32, right_busy: bool) {
+    let j = &mut p.joints;
+    let s = r.push.sin();
+    p.lift = ride_lift(r.kind);
+    match r.stance {
+        Stance::Sideways => {
+            // Side-on, feet apart along the board, knees soft, arms out for balance.
+            p.body_yaw = SIDEWAYS_YAW;
+            j[L_HIP] = (0.35, -0.32);
+            j[R_HIP] = (0.35, 0.32);
+            j[L_KNEE] = (-0.7, 0.0);
+            j[R_KNEE] = (-0.7, 0.0);
+            j[L_ANKLE] = (0.35, 0.0);
+            j[R_ANKLE] = (0.35, 0.0);
+            j[SPINE] = (-0.12, 0.0);
+            j[NECK] = (0.0, 0.0);
+            j[L_SHOULDER] = (0.35, -0.75);
+            j[L_ELBOW] = (0.3, 0.0);
+            if !right_busy {
+                j[R_SHOULDER] = (0.2, 0.65);
+                j[R_ELBOW] = (0.3, 0.0);
+            }
+            p.drop = 0.1;
+        }
+        Stance::Forward if r.kind == MountKind::Bmx => {
+            // Up on the pedals, leaning over the bars.
+            j[L_HIP] = (0.85 + 0.15 * s, -0.08);
+            j[R_HIP] = (0.85 - 0.15 * s, 0.08);
+            j[L_KNEE] = (-1.1, 0.0);
+            j[R_KNEE] = (-1.1, 0.0);
+            j[L_ANKLE] = (0.3, 0.0);
+            j[R_ANKLE] = (0.3, 0.0);
+            j[SPINE] = (-0.55, 0.0);
+            j[NECK] = (0.45, 0.0);
+            j[L_SHOULDER] = (1.3, -0.12);
+            j[L_ELBOW] = (0.6, 0.0);
+            p.grip[0] = 0.85;
+            if !right_busy {
+                j[R_SHOULDER] = (1.3, 0.12);
+                j[R_ELBOW] = (0.6, 0.0);
+                p.grip[1] = 0.85;
+            }
+            p.drop = 0.15;
+        }
+        Stance::Forward => {
+            // Scooter: left foot on the deck, right foot kicking, hands on the bars.
+            let kick = s.max(0.0);
+            j[L_HIP] = (0.15, -0.05);
+            j[L_KNEE] = (-0.35, 0.0);
+            j[R_HIP] = (0.3 - 0.9 * kick, 0.08);
+            j[R_KNEE] = (-0.5 * (1.0 - kick), 0.0);
+            j[SPINE] = (-0.2, 0.0);
+            j[L_SHOULDER] = (1.05, -0.1);
+            j[L_ELBOW] = (0.5, 0.0);
+            p.grip[0] = 0.85;
+            if !right_busy {
+                j[R_SHOULDER] = (1.05, 0.1);
+                j[R_ELBOW] = (0.5, 0.0);
+                p.grip[1] = 0.85;
+            }
+        }
+        Stance::Skates => {
+            // Skating stride: push out sideways one leg at a time, arms swinging.
+            j[L_HIP] = (0.35 + 0.25 * s, -0.2 - 0.25 * s.max(0.0));
+            j[R_HIP] = (0.35 - 0.25 * s, 0.2 + 0.25 * (-s).max(0.0));
+            j[L_KNEE] = (-0.65, 0.0);
+            j[R_KNEE] = (-0.65, 0.0);
+            j[L_ANKLE] = (0.3, 0.0);
+            j[R_ANKLE] = (0.3, 0.0);
+            j[SPINE] = (-0.4, 0.0);
+            j[NECK] = (0.35, 0.0);
+            j[L_SHOULDER] = (-0.6 * s, -0.15);
+            if !right_busy {
+                j[R_SHOULDER] = (0.6 * s, 0.15);
+            }
+            p.drop = 0.08;
+        }
+    }
+
+    if r.bail {
+        // Off balance: arms windmilling, leaning back.
+        let w = (time * 18.0).sin();
+        j[L_SHOULDER] = (2.3 + 0.6 * w, -0.7);
+        if !right_busy {
+            j[R_SHOULDER] = (2.3 - 0.6 * w, 0.7);
+        }
+        j[SPINE] = (0.45, 0.0);
+        p.body_pitch += 0.25;
+        return;
+    }
+
+    if let Some(g) = r.grind {
+        // Low on the rail, arms out.
+        let c = g.crouch.clamp(0.0, 1.0);
+        j[L_HIP] = (j[L_HIP].0 + 0.9 * c, j[L_HIP].1);
+        j[R_HIP] = (j[R_HIP].0 + 0.9 * c, j[R_HIP].1);
+        j[L_KNEE] = (j[L_KNEE].0 - 1.2 * c, 0.0);
+        j[R_KNEE] = (j[R_KNEE].0 - 1.2 * c, 0.0);
+        j[L_ANKLE] = (j[L_ANKLE].0 + 0.5 * c, 0.0);
+        j[R_ANKLE] = (j[R_ANKLE].0 + 0.5 * c, 0.0);
+        j[SPINE] = (j[SPINE].0 + g.lean, 0.0);
+        if r.stance != Stance::Forward {
+            j[L_SHOULDER] = (0.3, -1.2);
+            if !right_busy {
+                j[R_SHOULDER] = (0.3, 1.2);
+            }
+        }
+        p.drop += 0.25 * c;
+        trick_legs(p, g.legs, 1.0);
+        return;
+    }
+
+    let Some((cat, a, progress)) = r.trick else { return };
+    let prog = progress.min(1.0);
+    // Flips ease in and out; grabs hold while the button is held.
+    let w = match cat {
+        TrickCat::Grab => (progress * 4.0).min(1.0),
+        _ => (prog * PI).sin().max((prog * 3.0).min(1.0) * (1.0 - prog) * 2.0).min(1.0),
+    };
+    trick_legs(p, a.legs, w);
+    let j = &mut p.joints;
+    j[SPINE] = (j[SPINE].0 + a.lean * w, 0.0);
+    p.body_pitch += TAU * a.body_flip * prog;
+    p.body_yaw += TAU * a.body_spin * prog;
+    if let Some(g) = a.grab {
+        let hands: &[usize] = match g.hand {
+            Hand::Left => &[0],
+            Hand::Right => &[1],
+            Hand::Both => &[0, 1],
+        };
+        for &h in hands {
+            if h == 1 && right_busy {
+                continue;
+            }
+            let side = if h == 0 { -1.0 } else { 1.0 };
+            // Arms out wide (no-handers) or reaching for that part of the board / skate.
+            let wide = g.spot == Spot::Skate && !r.kind.on_feet();
+            let (pitch, roll) = match g.spot {
+                _ if wide => (0.3, 1.4 * side),
+                Spot::Nose => (1.25, -0.2 * side),
+                Spot::Tail => (-0.45, 0.15 * side),
+                Spot::Toe => (0.65, -0.35 * side),
+                Spot::Heel => (0.35, 0.35 * side),
+                Spot::Mid | Spot::Skate => (0.55, -0.25 * side),
+                Spot::Bars => (1.3, 0.1 * side),
+                Spot::Seat => (0.1, 0.1 * side),
+            };
+            let (sh, el) = (L_SHOULDER + 2 * h, L_ELBOW + 2 * h);
+            j[sh] = (lerp(j[sh].0, pitch, w), lerp(j[sh].1, roll, w));
+            j[el] = (lerp(j[el].0, 0.2, w), 0.0);
+            p.grip[h] = lerp(p.grip[h], if wide { 0.1 } else { 0.9 }, w);
+        }
+    }
+}
+
 /// Rotation of one finger joint for a hand that is `grip` closed.
 fn finger_rotation(hand: usize, bone: FingerBone, grip: f32) -> Quat {
     // Curling toward the palm turns about Z: +Z for the left hand, -Z for the right.
@@ -749,8 +1034,10 @@ pub fn animate_rigs(
     time: Res<Time>,
     view: Res<crate::session::View>,
     local: Res<LocalRigInput>,
+    local_ride: Res<crate::player::LocalRide>,
+    lib: Res<MountLibrary>,
     assets: Res<RigAssets>,
-    mut rigs: Query<(&mut Rig, &GlobalTransform)>,
+    mut rigs: Query<(&mut Rig, &GlobalTransform, &mut Transform)>,
     mut transforms: Query<&mut Transform, Without<Rig>>,
     mut mats: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
@@ -764,7 +1051,7 @@ pub fn animate_rigs(
             _ => None,
         })
         .collect();
-    for (mut rig, gt) in &mut rigs {
+    for (mut rig, gt, mut root_tf) in &mut rigs {
         let pv: Option<&PlayerView> = match rig.player {
             Some(id) => snap.players.iter().find(|p| p.id == id),
             None => view.me(),
@@ -819,8 +1106,20 @@ pub fn animate_rigs(
             time: time.elapsed_secs() + pv.id as f32 * 0.7,
             catch_t: a.catch_t,
             crouch: if is_local { local.crouch } else { pv.cover == crate::sim::CoverPose::Crouched },
+            ride: if is_local {
+                local_ride.ride.as_ref().map(|rd| ride_pose(&rd.view(lib.get(rd.mount)), &lib))
+            } else {
+                pv.ride.as_ref().map(|v| ride_pose(v, &lib))
+            },
         };
         let p = pose(&input);
+        r.ride = input.ride;
+        r.pose_drop = p.drop;
+        r.pose_lunge = p.lunge;
+        r.pose_lift = p.lift;
+        r.pose_yaw = p.body_yaw;
+        root_tf.translation = r.offset + Vec3::Y * p.lift;
+        root_tf.rotation = Quat::from_rotation_y(p.body_yaw);
 
         if let Ok(mut tf) = transforms.get_mut(r.flip) {
             tf.translation = Vec3::new(0.0, PIVOT - p.drop, -p.lunge);
@@ -998,6 +1297,59 @@ mod tests {
         assert!(later.lunge.abs() < 0.05, "recovered");
         let done = pose(&PoseInput { holding: true, catch_t: CATCH_ANIM_SECS, ..idle() });
         assert_eq!(done, pose(&PoseInput { holding: true, ..idle() }));
+    }
+
+    fn rider(kind: MountKind, stance: Stance) -> RidePose {
+        RidePose { kind, stance, trick: None, grind: None, push: 0.0, speed: 5.0, bail: false }
+    }
+
+    #[test]
+    fn riders_take_their_mount_stance() {
+        let board = pose(&PoseInput { ride: Some(rider(MountKind::Skateboard, Stance::Sideways)), ..idle() });
+        assert_eq!(board.body_yaw, SIDEWAYS_YAW, "side-on");
+        assert!(board.lift > 0.05, "standing on the deck");
+        let bmx = pose(&PoseInput { ride: Some(rider(MountKind::Bmx, Stance::Forward)), ..idle() });
+        assert_eq!(bmx.body_yaw, 0.0);
+        assert!(bmx.joints[L_SHOULDER].0 > 1.0 && bmx.grip[0] > 0.8, "hands on the bars");
+        assert!(bmx.lift > 0.25, "up on the pedals");
+        let skates = pose(&PoseInput { ride: Some(RidePose { push: FRAC_PI_2, ..rider(MountKind::InlineSkates, Stance::Skates) }), ..idle() });
+        assert!(skates.joints[L_HIP].1 < -0.3, "pushing out to the side");
+    }
+
+    #[test]
+    fn trick_data_drives_the_rider() {
+        let lib = MountLibrary::built_in();
+        let def = lib.get(MountKind::Skateboard);
+        let back = def.air_flips.iter().find(|t| t.anim.body_flip > 0.0).unwrap().anim;
+        let mid = pose(&PoseInput {
+            ride: Some(RidePose { trick: Some((TrickCat::AirFlip, back, 0.5)), ..rider(MountKind::Skateboard, Stance::Sideways) }),
+            ..idle()
+        });
+        assert!((mid.body_pitch - PI).abs() < 1e-4, "half way round a back flip");
+        let indy = def.grabs[0].anim;
+        let grab = pose(&PoseInput {
+            ride: Some(RidePose { trick: Some((TrickCat::Grab, indy, 0.6)), ..rider(MountKind::Skateboard, Stance::Sideways) }),
+            ..idle()
+        });
+        assert!(grab.joints[L_KNEE].0 < -1.8, "tucked for the grab");
+        assert!(grab.grip[1] > 0.8, "right hand holding the board");
+        let inline = lib.get(MountKind::InlineSkates);
+        let spin = inline.flips[0].anim; // flatspin 360
+        let half = pose(&PoseInput {
+            ride: Some(RidePose { trick: Some((TrickCat::Flip, spin, 0.5)), ..rider(MountKind::InlineSkates, Stance::Skates) }),
+            ..idle()
+        });
+        assert!((half.body_yaw - PI).abs() < 1e-4, "half way round a 360");
+    }
+
+    #[test]
+    fn grinding_crouches_and_bails_flail() {
+        let lib = MountLibrary::built_in();
+        let g = lib.get(MountKind::Skateboard).grinds[5].anim; // smith, deep crouch
+        let p = pose(&PoseInput { ride: Some(RidePose { grind: Some(g), ..rider(MountKind::Skateboard, Stance::Sideways) }), ..idle() });
+        assert!(p.drop > 0.2);
+        let bail = pose(&PoseInput { ride: Some(RidePose { bail: true, ..rider(MountKind::Skateboard, Stance::Sideways) }), ..idle() });
+        assert!(bail.joints[L_SHOULDER].0 > 1.5, "arms up");
     }
 
     #[test]

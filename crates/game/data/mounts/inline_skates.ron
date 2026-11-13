@@ -1,0 +1,49 @@
+// Inline skates. Same inputs as the skateboard (see skateboard.ron). Flips are spins and
+// inverts of the skater (body_spin / body_flip); grabs reach for a skate; grinds set the
+// skates across (angle) or along the rail with the soul plate (tilt).
+(
+    name: "Inline Skates",
+    kind: InlineSkates,
+    stance: Skates,
+    stats: (top_speed: 11.0, push: 10.0, turn: 4.5, jump: 8.5, friction: 0.3, grind_speed: 9.5),
+    flips: [
+        (name: "Flatspin 360",   input: (dir: None),      secs: 0.5,  points: 300, anim: (body_spin: 1.0, legs: Tuck)),
+        (name: "Flatspin 540",   input: (dir: Down),      secs: 0.65, points: 450, anim: (body_spin: 1.5, legs: Tuck)),
+        (name: "Misty Flip",     input: (dir: Up),        secs: 0.7,  points: 600, anim: (body_spin: 1.5, body_flip: -0.5, legs: Tuck)),
+        (name: "Bio 540",        input: (dir: Left),      secs: 0.7,  points: 600, anim: (body_spin: 1.5, body_flip: 0.5, legs: Tuck)),
+        (name: "Cork 540",       input: (dir: Right),     secs: 0.7,  points: 620, anim: (body_spin: 1.5, board_roll: 1.0, legs: Tuck)),
+        (name: "Rodeo 720",      input: (dir: UpLeft),    secs: 0.85, points: 800, anim: (body_spin: 2.0, body_flip: -1.0, legs: Tuck)),
+        (name: "Kangaroo Flip",  input: (dir: UpRight),   secs: 0.7,  points: 650, anim: (body_flip: 1.0, body_spin: 0.5, legs: Extend)),
+        (name: "Corkscrew",      input: (dir: DownLeft),  secs: 0.8,  points: 700, anim: (body_spin: 2.0, board_roll: 1.0, legs: Tuck)),
+        (name: "Double Misty",   input: (dir: DownRight), secs: 0.9,  points: 900, anim: (body_spin: 2.5, body_flip: -1.0, legs: Tuck)),
+        (name: "Flatspin 900",   input: (dir: None, shift: true), secs: 0.9, points: 1000, anim: (body_spin: 2.5, legs: Tuck)),
+    ],
+    grabs: [
+        (name: "Mute",        input: (dir: None),      secs: 0.4, points: 250, anim: (grab: Some((hand: Left, spot: Skate)), legs: Tuck)),
+        (name: "Japan",       input: (dir: Down),      secs: 0.45, points: 300, anim: (grab: Some((hand: Left, spot: Skate)), legs: Kick)),
+        (name: "Stale",       input: (dir: Up),        secs: 0.4, points: 280, anim: (grab: Some((hand: Right, spot: Heel)), legs: Tuck)),
+        (name: "Safety",      input: (dir: Left),      secs: 0.4, points: 260, anim: (grab: Some((hand: Right, spot: Skate)), legs: Tuck)),
+        (name: "Liu Kang",    input: (dir: Right),     secs: 0.5, points: 400, anim: (grab: Some((hand: Left, spot: Skate)), legs: OneFoot)),
+        (name: "Rocket",      input: (dir: UpLeft),    secs: 0.5, points: 420, anim: (grab: Some((hand: Both, spot: Toe)), legs: Extend, lean: -0.4)),
+        (name: "Soul Grab",   input: (dir: UpRight),   secs: 0.45, points: 330, anim: (grab: Some((hand: Right, spot: Mid)), legs: Tuck)),
+        (name: "Tweak",       input: (dir: DownLeft),  secs: 0.5, points: 380, anim: (grab: Some((hand: Left, spot: Heel)), legs: Kick, lean: 0.3)),
+        (name: "Christ Air",  input: (dir: DownRight), secs: 0.6, points: 550, anim: (grab: None, legs: Extend, lean: -0.2)),
+        (name: "Truck Grab",  input: (dir: None, shift: true), secs: 0.55, points: 450, anim: (grab: Some((hand: Both, spot: Skate)), legs: Tuck)),
+    ],
+    grinds: [
+        (name: "Royale",      input: (dir: None),      points: 220, anim: (angle: 90.0, crouch: 0.5)),
+        (name: "Soul",        input: (dir: Down),      points: 220, anim: (angle: 90.0, tilt: 10.0, crouch: 0.4, legs: Split)),
+        (name: "Mizou",       input: (dir: Up),        points: 260, anim: (angle: 90.0, crouch: 0.6, legs: Cross)),
+        (name: "Unity",       input: (dir: Left),      points: 300, anim: (angle: 90.0, crouch: 0.6, legs: Cross, lean: 0.2)),
+        (name: "Makio",       input: (dir: Right),     points: 280, anim: (angle: 0.0, crouch: 0.5, legs: OneFoot)),
+        (name: "Frontside",   input: (dir: UpLeft),    points: 200, anim: (angle: 90.0, crouch: 0.3)),
+        (name: "Backside",    input: (dir: UpRight),   points: 240, anim: (angle: -90.0, crouch: 0.3)),
+        (name: "Torque Soul", input: (dir: DownLeft),  points: 320, anim: (angle: 70.0, tilt: 10.0, crouch: 0.6, legs: Split)),
+        (name: "Top Soul",    input: (dir: DownRight), points: 300, anim: (angle: 90.0, tilt: -10.0, crouch: 0.5)),
+        (name: "Acid",        input: (dir: None, shift: true), points: 380, anim: (angle: -70.0, crouch: 0.7, legs: Split)),
+    ],
+    air_flips: [
+        (name: "Front Flip", input: (dir: Up),   secs: 0.7, points: 800, anim: (body_flip: -1.0, legs: Tuck)),
+        (name: "Back Flip",  input: (dir: Down), secs: 0.7, points: 800, anim: (body_flip: 1.0, legs: Tuck)),
+    ],
+)

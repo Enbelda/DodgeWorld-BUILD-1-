@@ -5,7 +5,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use crate::camera::{CursorLocked, FollowCamera};
-use crate::player::{Charge, LocalDash, LockOn, MoveIntent, DASH_CHARGES, DASH_RECHARGE};
+use crate::player::{Charge, LocalDash, LocalRide, LockOn, MoveIntent, DASH_CHARGES, DASH_RECHARGE};
 use crate::session::{SessionSet, View};
 use crate::sim::ball::BallKind;
 use crate::sim::{
@@ -27,6 +27,7 @@ enum HudText {
     Crosshair,
     /// Big warnings under the crosshair: incoming ball, locked on, slimed.
     Alert,
+    Ride,
 }
 
 /// Flashing red ring around the crosshair: press catch now for a perfect catch.
@@ -81,18 +82,31 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_hud)
-            .add_systems(Update, (update_hud, update_hearts, place_incoming_marker, perfect_ring).after(SessionSet));
+            .add_systems(Update, (update_hud, update_hearts, place_incoming_marker, perfect_ring, toggle_controls).after(SessionSet));
     }
 }
 
-const CONTROLS: &str = "WASD move   Shift sprint   Ctrl dash/tackle   Space jump (x2 in air)\n\
+const CONTROLS: &str = "H: hide these   WASD move   Shift sprint   Ctrl dash/tackle   Space jump (x2 in air)\n\
 Hold LMB: charge (locks the enemy under the crosshair), release: throw   Q/E: curve   F while charging: lob\n\
 RMB: catch - time it! red ring = PERFECT   While charging: swing the mouse (or Tab/MMB) to switch target\n\
 F by a wall: take cover (A/D slide, charge to rise and throw over it; F / sprint to leave)\n\
+1-6 mounts (X off)   Riding: Space ollie   air: Q/E + WASD flip/grab, R+W/S flip   hold F: grind\n\
 In the air: Q/E spin 180   W+Q/E front flip   S+Q/E back flip   Esc: free mouse\n\
 Parkour: jump along a tall wall = wall run (Space: wall jump)   jump into it = climb   grab ledges";
 
-fn spawn_hud(mut commands: Commands) {
+/// The controls cheat sheet (H shows / hides it).
+#[derive(Component)]
+struct ControlsText;
+
+fn toggle_controls(keys: Res<ButtonInput<KeyCode>>, mut q: Query<&mut Visibility, With<ControlsText>>) {
+    if keys.just_pressed(KeyCode::KeyH) {
+        for mut v in &mut q {
+            *v = if *v == Visibility::Hidden { Visibility::Inherited } else { Visibility::Hidden };
+        }
+    }
+}
+
+fn spawn_hud(mut commands: Commands, auto: Res<crate::player::Autopilot>) {
     let text = |s: &str, size: f32| (Text::new(s), TextFont::from_font_size(size), TextColor(Color::WHITE));
     let abs = |top: Option<f32>, bottom: Option<f32>, left: Option<f32>, right: Option<f32>| Node {
         position_type: PositionType::Absolute,
@@ -166,11 +180,22 @@ fn spawn_hud(mut commands: Commands) {
             }
         });
     commands.spawn((text("", 18.0), abs(Some(10.0), None, None, Some(12.0)), HudText::Feed));
+    // Riding: mount, speed, combo and tricks, on the left half way down.
+    commands.spawn((
+        Text::new(""),
+        TextFont::from_font_size(20.0),
+        TextColor(Color::srgb(1.0, 0.92, 0.5)),
+        Node { position_type: PositionType::Absolute, top: Val::Percent(38.0), left: Val::Px(12.0), ..default() },
+        HudText::Ride,
+    ));
     commands.spawn((
         Text::new(CONTROLS),
-        TextFont::from_font_size(14.0),
+        TextFont::from_font_size(13.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
         abs(None, Some(12.0), None, Some(12.0)),
+        ControlsText,
+        // Out of the way during automated play-tests (H still toggles it).
+        if auto.0 { Visibility::Hidden } else { Visibility::Inherited },
     ));
     // Crosshair at the exact screen centre.
     commands
@@ -287,6 +312,7 @@ fn update_hud(
     lock: Res<LockOn>,
     dash: Res<LocalDash>,
     intent: Res<MoveIntent>,
+    (ride, lib): (Res<LocalRide>, Res<crate::mounts::MountLibrary>),
     mut texts: Query<(&HudText, &mut Text, &mut TextColor)>,
 ) {
     let snap = view.snap.as_ref();
@@ -395,6 +421,13 @@ fn update_hud(
                     s
                 }
             },
+            HudText::Ride => {
+                let mut s = ride.ride.as_ref().map_or(String::new(), |r| ride_status(r, &lib.get(r.mount).name));
+                for (_, m) in &ride.feed {
+                    s.push_str(&format!("\n{m}"));
+                }
+                s.trim_start().to_string()
+            }
             HudText::Feed => view.feed.iter().map(|(_, m)| m.as_str()).collect::<Vec<_>>().join("\n"),
             HudText::Alert => match (snap, me) {
                 (Some(s), Some(m)) if m.alive() => alerts(s, m, lock.0),
@@ -462,6 +495,21 @@ fn held_kind(snap: Option<&Snapshot>, id: PlayerId) -> Option<BallKind> {
 }
 
 /// Warning lines for the local player.
+/// The riding line: mount, speed, and the combo building up.
+pub fn ride_status(r: &crate::ride::Ride, name: &str) -> String {
+    let mut s = format!("\n{}  {:.0} m/s", name.to_uppercase(), r.speed);
+    if r.grind.is_some() {
+        s.push_str("  GRINDING");
+    }
+    if r.bail > 0.0 {
+        s.push_str("  BAIL!");
+    }
+    if !r.combo.names.is_empty() {
+        s.push_str(&format!("\nCOMBO {} x{} = {}", r.combo.names.join(" + "), r.combo.multiplier(), r.combo.total()));
+    }
+    s
+}
+
 fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
     let name = |id: PlayerId| s.players.iter().find(|p| p.id == id).map_or("?".to_string(), |p| p.name.clone());
     let mut lines = Vec::new();
@@ -587,5 +635,14 @@ mod tests {
         assert_eq!(bar(0.0, 4), "[....]");
         assert_eq!(bar(0.5, 4), "[||..]");
         assert_eq!(bar(2.0, 4), "[||||]");
+    }
+
+    #[test]
+    fn ride_status_shows_the_combo() {
+        let mut r = crate::ride::Ride::new(crate::mounts::MountKind::Bmx, 0.0, 9.6);
+        assert_eq!(ride_status(&r, "BMX"), "\nBMX  10 m/s");
+        r.combo.names = vec!["Tailwhip".into(), "Barspin".into()];
+        r.combo.points = 700.0;
+        assert!(ride_status(&r, "BMX").contains("COMBO Tailwhip + Barspin x2 = 1400"));
     }
 }

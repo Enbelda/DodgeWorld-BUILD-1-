@@ -1,0 +1,49 @@
+// BMX bike. Same inputs as the skateboard (see skateboard.ron). Flips whip the frame
+// round the head tube (frame_whip) or spin the bars (bar_spin); grabs take hands or feet
+// off; grinds put the pegs on the rail (angle = how the bike sits on it).
+(
+    name: "BMX",
+    kind: Bmx,
+    stance: Forward,
+    stats: (top_speed: 15.0, push: 10.0, turn: 3.0, jump: 8.5, friction: 0.2, grind_speed: 10.5),
+    flips: [
+        (name: "Tailwhip",         input: (dir: None),      secs: 0.5,  points: 400, anim: (frame_whip: 1.0, legs: Split)),
+        (name: "Barspin",          input: (dir: Down),      secs: 0.4,  points: 300, anim: (bar_spin: 1.0)),
+        (name: "360",              input: (dir: Left),      secs: 0.6,  points: 450, anim: (body_spin: 1.0)),
+        (name: "Double Tailwhip",  input: (dir: Up),        secs: 0.7,  points: 750, anim: (frame_whip: 2.0, legs: Split)),
+        (name: "Double Barspin",   input: (dir: Right),     secs: 0.55, points: 550, anim: (bar_spin: 2.0)),
+        (name: "Cash Roll",        input: (dir: UpLeft),    secs: 0.7,  points: 800, anim: (body_spin: 1.0, body_flip: 0.0, board_roll: 1.0)),
+        (name: "Decade",           input: (dir: UpRight),   secs: 0.6,  points: 600, anim: (body_spin: 1.0, legs: Extend)),
+        (name: "360 Tailwhip",     input: (dir: DownLeft),  secs: 0.75, points: 850, anim: (body_spin: 1.0, frame_whip: 1.0, legs: Split)),
+        (name: "360 Barspin",      input: (dir: DownRight), secs: 0.7,  points: 700, anim: (body_spin: 1.0, bar_spin: 1.0)),
+        (name: "Bikeflip",         input: (dir: None, shift: true), secs: 0.8, points: 900, anim: (board_pitch: 1.0, legs: Extend)),
+    ],
+    grabs: [
+        (name: "No Hander",  input: (dir: None),      secs: 0.4, points: 250, anim: (grab: Some((hand: Both, spot: Skate)), legs: Normal, lean: -0.2)),
+        (name: "No Footer",  input: (dir: Down),      secs: 0.4, points: 250, anim: (grab: Some((hand: Both, spot: Bars)), legs: Split)),
+        (name: "Can-Can",    input: (dir: Left),      secs: 0.45, points: 300, anim: (grab: Some((hand: Both, spot: Bars)), legs: OneFoot)),
+        (name: "Superman",   input: (dir: Up),        secs: 0.55, points: 450, anim: (grab: Some((hand: Both, spot: Bars)), legs: Extend, lean: -0.5)),
+        (name: "Tabletop",   input: (dir: Right),     secs: 0.5, points: 350, anim: (grab: Some((hand: Both, spot: Bars)), legs: Tuck, lean: 0.3)),
+        (name: "Turndown",   input: (dir: UpLeft),    secs: 0.5, points: 400, anim: (grab: Some((hand: Both, spot: Bars)), legs: Tuck, lean: -0.3)),
+        (name: "Seat Grab",  input: (dir: UpRight),   secs: 0.5, points: 380, anim: (grab: Some((hand: Left, spot: Seat)), legs: Kick)),
+        (name: "Candybar",   input: (dir: DownLeft),  secs: 0.5, points: 400, anim: (grab: Some((hand: Both, spot: Bars)), legs: Cross)),
+        (name: "X-Up",       input: (dir: DownRight), secs: 0.45, points: 350, anim: (grab: Some((hand: Both, spot: Bars)), legs: Normal, lean: 0.2)),
+        (name: "Lazy Boy",   input: (dir: None, shift: true), secs: 0.6, points: 550, anim: (grab: Some((hand: Both, spot: Skate)), legs: Extend, lean: 0.6)),
+    ],
+    grinds: [
+        (name: "Double Peg", input: (dir: None),      points: 220, anim: (angle: 0.0, crouch: 0.4)),
+        (name: "Feeble",     input: (dir: Down),      points: 250, anim: (angle: 10.0, tilt: 8.0, crouch: 0.4, lean: -0.2)),
+        (name: "Smith",      input: (dir: Up),        points: 250, anim: (angle: -10.0, tilt: 8.0, crouch: 0.4, lean: 0.2)),
+        (name: "Icepick",    input: (dir: Left),      points: 300, anim: (angle: 0.0, tilt: -25.0, crouch: 0.3)),
+        (name: "Toothpick",  input: (dir: Right),     points: 300, anim: (angle: 0.0, tilt: 25.0, crouch: 0.3)),
+        (name: "Crooked",    input: (dir: UpLeft),    points: 280, anim: (angle: 20.0, crouch: 0.5)),
+        (name: "Luc-E",      input: (dir: UpRight),   points: 320, anim: (angle: -20.0, tilt: 15.0, crouch: 0.6)),
+        (name: "Unlucky",    input: (dir: DownLeft),  points: 340, anim: (angle: 25.0, tilt: -15.0, crouch: 0.6)),
+        (name: "Hangover",   input: (dir: DownRight), points: 360, anim: (angle: 90.0, crouch: 0.7, lean: 0.3)),
+        (name: "Sprocket",   input: (dir: None, shift: true), points: 400, anim: (angle: 0.0, tilt: 5.0, crouch: 0.8)),
+    ],
+    air_flips: [
+        (name: "Front Flip", input: (dir: Up),   secs: 0.8, points: 900, anim: (body_flip: -1.0)),
+        (name: "Back Flip",  input: (dir: Down), secs: 0.8, points: 900, anim: (body_flip: 1.0)),
+    ],
+)

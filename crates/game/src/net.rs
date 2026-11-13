@@ -9,9 +9,9 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use bevy::math::Vec3;
 use serde::{Deserialize, Serialize};
 
-use crate::sim::{Action, Match, ParkourPose, PlayerId, Snapshot, TrickState, CoverPose};
+use crate::sim::{Action, Match, ParkourPose, PlayerId, Snapshot, TrickState, CoverPose, RideView};
 
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 7;
 pub const DEFAULT_PORT: u16 = 47800;
 /// A peer that sends nothing for this long is dropped.
 pub const TIMEOUT_SECS: f64 = 5.0;
@@ -27,6 +27,7 @@ pub enum ToHost {
         dash: Option<u32>,
         parkour: ParkourPose,
         cover: CoverPose,
+        ride: Option<RideView>,
         actions: Vec<(u32, Action)>,
     },
     Leave,
@@ -122,13 +123,14 @@ impl HostNet {
                     None => send(&self.sock, from, &ToClient::Rejected { reason: "lobby is full".into() }),
                 }
             }
-            ToHost::Update { pos, yaw, trick, dash, parkour, cover, actions } => {
+            ToHost::Update { pos, yaw, trick, dash, parkour, cover, ride, actions } => {
                 let Some(peer) = self.peers.get_mut(&from) else { return };
                 peer.last_seen = now;
                 m.set_pose(peer.id, Vec3::from_array(pos), yaw);
                 m.set_trick(peer.id, trick);
                 m.set_parkour(peer.id, parkour);
                 m.set_cover(peer.id, cover);
+                m.set_ride(peer.id, ride);
                 m.set_dash(peer.id, dash);
                 let mut sorted = actions;
                 sorted.sort_by_key(|(seq, _)| *seq);
@@ -267,6 +269,7 @@ impl ClientNet {
         dash: Option<u32>,
         parkour: ParkourPose,
         cover: CoverPose,
+        ride: Option<RideView>,
         now: f64,
     ) {
         match self.status {
@@ -282,7 +285,7 @@ impl ClientNet {
             }
             ClientStatus::Connected(_) => {
                 let msg =
-                    ToHost::Update { pos: pos.to_array(), yaw, trick, dash, parkour, cover, actions: self.pending.clone() };
+                    ToHost::Update { pos: pos.to_array(), yaw, trick, dash, parkour, cover, ride, actions: self.pending.clone() };
                 send(&self.sock, self.host, &msg);
             }
             _ => {}
@@ -303,7 +306,7 @@ mod tests {
         for _ in 0..50 {
             *now += 0.02;
             let trick = Some(TrickState { kind: crate::sim::TrickKind::FrontFlip, progress: 0.5 });
-            c.send_update(pos, 0.0, trick, None, ParkourPose::Hang, CoverPose::None, *now);
+            c.send_update(pos, 0.0, trick, None, ParkourPose::Hang, CoverPose::None, None, *now);
             std::thread::sleep(std::time::Duration::from_millis(2));
             host.receive(m, *now);
             m.step(0.02);

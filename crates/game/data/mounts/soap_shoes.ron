@@ -1,0 +1,9 @@
+// Soap shoes: sneakers with a hard plastic plate in the sole. They do every inline skate
+// trick (taken from inline_skates.ron), but roll slower and slide on rails faster.
+(
+    name: "Soap Shoes",
+    kind: SoapShoes,
+    stance: Skates,
+    stats: (top_speed: 9.0, push: 8.0, turn: 5.0, jump: 8.0, friction: 0.35, grind_speed: 11.5),
+    tricks_from: Some(InlineSkates),
+)

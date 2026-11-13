@@ -2096,6 +2096,7 @@ dependencies = [
  "bevy_rapier3d",
  "bincode",
  "brawl_ranked",
+ "ron",
  "serde",
 ]
 

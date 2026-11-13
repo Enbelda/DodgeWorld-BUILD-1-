@@ -82,6 +82,94 @@ pub fn solids(arena: ArenaId) -> Vec<Aabb> {
         Aabb::from_center(Vec3::new(-h - t / 2.0, y, 0.0), Vec3::new(t / 2.0, y, h)),
     ];
     v.extend(cover(arena));
+    v.extend(rail_boxes(arena));
+    v
+}
+
+/// Height of the top of a free-standing grind rail.
+pub const RAIL_HEIGHT: f32 = 0.55;
+/// Half the thickness of a rail bar.
+pub const RAIL_HALF: f32 = 0.04;
+
+/// A grindable line: a rail's top, or the top edge of a low wall (a ledge).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rail {
+    pub a: Vec3,
+    pub b: Vec3,
+}
+
+impl Rail {
+    pub fn dir(&self) -> Vec3 {
+        (self.b - self.a).normalize_or_zero()
+    }
+    pub fn len(&self) -> f32 {
+        self.a.distance(self.b)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() < 1e-3
+    }
+    /// The point at distance `s` along the rail.
+    pub fn at(&self, s: f32) -> Vec3 {
+        self.a + self.dir() * s
+    }
+    /// Distance along the rail of the point closest to `p` (clamped to the rail).
+    pub fn project(&self, p: Vec3) -> f32 {
+        (p - self.a).dot(self.dir()).clamp(0.0, self.len())
+    }
+}
+
+/// A rail's two ends on the floor plan: (x, z), (x, z).
+type RailPlan = ((f32, f32), (f32, f32));
+
+/// Free-standing rails (start, end of the top bar), mirrored through the centre.
+fn rail_lines(arena: ArenaId) -> Vec<(Vec3, Vec3)> {
+    let half: &[RailPlan] = match arena {
+        ArenaId::Classic => &[((12.0, 6.0), (12.0, 14.0))],
+        ArenaId::Grand => &[((10.0, 18.0), (10.0, 26.0)), ((-20.0, 5.0), (-12.0, 5.0)), ((-4.0, 19.0), (4.0, 19.0))],
+    };
+    let mut v = Vec::new();
+    for s in [1.0_f32, -1.0] {
+        for &((ax, az), (bx, bz)) in half {
+            v.push((Vec3::new(ax * s, RAIL_HEIGHT, az * s), Vec3::new(bx * s, RAIL_HEIGHT, bz * s)));
+        }
+    }
+    v
+}
+
+/// The rails as solid bars (part of `solids`).
+pub fn rail_boxes(arena: ArenaId) -> Vec<Aabb> {
+    rail_lines(arena)
+        .into_iter()
+        .map(|(a, b)| {
+            let c = (a + b) * 0.5;
+            let along = (b - a).abs() * 0.5;
+            Aabb::from_center(
+                Vec3::new(c.x, RAIL_HEIGHT / 2.0, c.z),
+                Vec3::new(along.x.max(RAIL_HALF), RAIL_HEIGHT / 2.0, along.z.max(RAIL_HALF)),
+            )
+        })
+        .collect()
+}
+
+/// A long, thin, low box: its top edge is a ledge you can grind.
+pub fn is_ledge(b: &Aabb) -> bool {
+    let h = b.half();
+    h.x.min(h.z) <= 0.5 && h.x.max(h.z) >= 2.0 && b.max.y <= 2.0 && b.min.y <= 0.01
+}
+
+/// Everything grindable: the free-standing rails and the top of every low wall.
+pub fn rails(arena: ArenaId) -> Vec<Rail> {
+    let mut v: Vec<Rail> = rail_lines(arena).into_iter().map(|(a, b)| Rail { a, b }).collect();
+    for b in cover(arena).iter().filter(|b| is_ledge(b)) {
+        let c = b.center();
+        let h = b.half();
+        let (a, e) = if h.x > h.z {
+            (Vec3::new(b.min.x + 0.2, b.max.y, c.z), Vec3::new(b.max.x - 0.2, b.max.y, c.z))
+        } else {
+            (Vec3::new(c.x, b.max.y, b.min.z + 0.2), Vec3::new(c.x, b.max.y, b.max.z - 0.2))
+        };
+        v.push(Rail { a, b: e });
+    }
     v
 }
 
@@ -268,5 +356,27 @@ mod tests {
                 assert!(clear(p, 0.6), "spawn {p} inside cover");
             }
         }
+    }
+
+    #[test]
+    fn both_arenas_have_rails_and_grindable_ledges() {
+        for arena in [ArenaId::Classic, ArenaId::Grand] {
+            let r = rails(arena);
+            let free = rail_boxes(arena).len();
+            assert!(free >= 2 && r.len() > free, "{arena:?}: rails plus ledges");
+            for rail in &r {
+                assert!(rail.len() > 3.0, "{rail:?}");
+                assert!(rail.a.x.abs() < arena.half() && rail.a.z.abs() < arena.half());
+            }
+            // Rails don't run through cover.
+            let cover = cover(arena);
+            for b in rail_boxes(arena) {
+                assert!(!cover.iter().any(|c| c.expanded(0.3).contains(b.center())), "{b:?}");
+            }
+        }
+        let r = Rail { a: Vec3::ZERO, b: Vec3::new(0.0, 0.0, 4.0) };
+        assert_eq!(r.project(Vec3::new(3.0, 1.0, 2.5)), 2.5);
+        assert_eq!(r.project(Vec3::new(0.0, 0.0, 9.0)), 4.0);
+        assert_eq!(r.at(1.0), Vec3::new(0.0, 0.0, 1.0));
     }
 }

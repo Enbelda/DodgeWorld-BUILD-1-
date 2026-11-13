@@ -52,6 +52,8 @@ pub enum BoxKind {
     Panel,
     /// Pillars, blocks, crates and bunkers: concrete.
     Block,
+    /// A free-standing grind rail: a metal bar on posts.
+    Rail,
 }
 
 /// Classify the n-th solid of an arena.
@@ -61,6 +63,8 @@ pub fn box_kind(index: usize, b: &Aabb) -> BoxKind {
     let long = h.x.max(h.z) >= 2.0;
     if index < 4 {
         BoxKind::Boundary
+    } else if h.x.min(h.z) <= layout::RAIL_HALF + 1e-4 {
+        BoxKind::Rail
     } else if thin && long && b.max.y <= 2.0 {
         BoxKind::LowWall
     } else if thin && b.max.y > 3.5 {
@@ -188,6 +192,13 @@ fn build_arena(
         textured(m, Color::srgb(0.25, 0.65, 0.7), &t.panel, 0.45),
     ];
     let stripe = m.add(StandardMaterial { base_color: Color::srgb(0.1, 0.1, 0.12), perceptual_roughness: 0.6, ..default() });
+    let chrome = m.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.87, 0.9),
+        metallic: 1.0,
+        perceptual_roughness: 0.18,
+        ..default()
+    });
+    let post = m.add(StandardMaterial { base_color: Color::srgb(0.95, 0.75, 0.1), metallic: 0.3, perceptual_roughness: 0.5, ..default() });
     for (i, s) in layout::solids(id).into_iter().enumerate() {
         let size = s.half() * 2.0;
         let kind = box_kind(i, &s);
@@ -242,6 +253,30 @@ fn build_arena(
                     MeshMaterial3d(stripe.clone()),
                     Transform::from_translation(Vec3::new(s.center().x, s.max.y - 0.15, s.center().z)),
                 ));
+            }
+            BoxKind::Rail => {
+                // Round bar along the top, yellow posts every ~2 m down to the floor.
+                let long_x = size.x > size.z;
+                let len = size.x.max(size.z);
+                let bar = Cylinder::new(0.045, len).mesh().resolution(16);
+                let rot = if long_x { Quat::from_rotation_z(std::f32::consts::FRAC_PI_2) } else { Quat::from_rotation_x(std::f32::consts::FRAC_PI_2) };
+                commands.spawn((
+                    ArenaGeo,
+                    Mesh3d(meshes.add(bar)),
+                    MeshMaterial3d(chrome.clone()),
+                    Transform::from_translation(Vec3::new(s.center().x, s.max.y - 0.045, s.center().z)).with_rotation(rot),
+                ));
+                let posts = (len / 2.0).ceil().max(1.0) as i32;
+                for k in 0..=posts {
+                    let off = -len / 2.0 + len * k as f32 / posts as f32;
+                    let at = s.center() + if long_x { Vec3::X * off } else { Vec3::Z * off };
+                    commands.spawn((
+                        ArenaGeo,
+                        Mesh3d(meshes.add(Cylinder::new(0.035, s.max.y).mesh().resolution(10))),
+                        MeshMaterial3d(post.clone()),
+                        Transform::from_translation(Vec3::new(at.x, s.max.y / 2.0, at.z)),
+                    ));
+                }
             }
             BoxKind::Block => {
                 commands.spawn((ArenaGeo, Mesh3d(meshes.add(tiled_box(size, 2.0))), MeshMaterial3d(concrete.clone()), Transform::from_translation(s.center())));
@@ -434,6 +469,7 @@ mod tests {
             let kinds: Vec<BoxKind> = s.iter().enumerate().map(|(i, b)| box_kind(i, b)).collect();
             assert!(kinds[..4].iter().all(|k| *k == BoxKind::Boundary));
             assert!(kinds.contains(&BoxKind::LowWall) && kinds.contains(&BoxKind::Panel) && kinds.contains(&BoxKind::Block));
+            assert_eq!(kinds.iter().filter(|k| **k == BoxKind::Rail).count(), layout::rail_boxes(arena).len());
             for (k, b) in kinds.iter().zip(&s) {
                 if *k == BoxKind::Panel {
                     assert!(b.max.y > 3.5);

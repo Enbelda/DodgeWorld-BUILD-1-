@@ -161,6 +161,43 @@
     sit in the holder's palm (cradled in both hands right after a catch). The brick is
     unchanged.
 
+- **Milestone 3 - mounts (playable).** 183 game tests + 23 ranked, clippy clean. Verified in
+  the real app with the `--ride-drill` autopilot: offline, every mount completes a lap (ollie
+  onto the rail holding F, grind it, flip trick off the end and land; back flips on alternate
+  laps), and as a LAN client (6 mounts, the host sees the rider, mount and combos). Protocol 7.
+  - Six mounts, each in its own RON data file in `crates/game/data/mounts/`: skateboard,
+    longboard, BMX, inline skates, scooter, soap shoes. Each has 10 flip tricks, 10 grabs,
+    10 grinds, plus a front flip and a back flip; soap shoes take every inline skate trick
+    (`tricks_from: Some(InlineSkates)`) with their own handling. The longboard is a
+    stretched skateboard: faster, slower to turn, less pop, slower-flipping deck.
+  - Each trick's file entry gives its name, keys, duration, points and animation (board
+    roll / spin / pitch, rider spin / flip, barspin, tailwhip, which hand grabs where, leg
+    shape, lean; grinds: board angle, tilt, crouch). The files are built in; a
+    `data/mounts` folder next to where the game starts overrides them (bad files fall back
+    to the built-in ones with a log message saying why).
+  - Riding: 1-6 hop on a mount (same key or X hops off; getting slimed, bricked, launched or
+    knocked out knocks you off). WASD carves toward that direction and pushes (Shift pushes
+    harder), pulling back brakes, letting go coasts; you glance off walls. Space ollies.
+    In the air: Q + WASD (+Shift) flip trick, E + WASD grab (hold E for bonus points),
+    R + W / R + S front / back flip. Hold F coming down onto a rail or the top of a low
+    wall to grind (F + WASD picks the grind); Space jumps off, the end pops you up.
+    Throwing, catching and dashing all still work while riding.
+  - Combos: tricks chain until you land; landing scores the sum x the number of tricks
+    (max x10). Landing a flip before 80% of it is done is a bail (off balance 1 s, combo
+    lost). Combos of 500+ show in everyone's feed; 1000+ while holding a ball charges it
+    (next throw at full power).
+  - Grind rails: free-standing rails in both arenas (2 classic, 6 grand), and the tops of
+    every low wall are grindable ledges.
+  - Visuals: mount models (deck with grip tape, trucks and rolling wheels; longboard; BMX
+    with frame, spoked wheels, pegs, cranks, spinning bars; scooter with stem and bars;
+    inline skates with four wheels; soap shoes with sole plates). Rider stances: side-on
+    on boards, up on the pedals over the bars on the BMX, kicking on the scooter, skating
+    stride on skates. Tricks animate from the data (kickflips roll the board, shove-its
+    spin it, tailwhips whip the frame round the head tube while the bars stay, barspins,
+    grabs reach for the board, flips go round with the mount). Grinds set the board at
+    the grind's angle. Bails windmill the arms.
+  - HUD: mount, speed, live combo and trick feed on the left; H hides the controls list.
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`
@@ -170,13 +207,18 @@
 - Esc frees the mouse; click to capture it again.
 - Host keys in warm-up also: V cycles the map (classic/grand, day/night). `--grand` starts
   on the grand arena.
-- Testing aids: `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts;
+- Mounts: 1 skateboard, 2 longboard, 3 BMX, 4 inline skates, 5 scooter, 6 soap shoes, X off.
+  Edit tricks in `crates/game/data/mounts/*.ron` (rebuild), or copy that folder to
+  `data/mounts` next to where you start the game to change them without rebuilding.
+- Testing aids: `--ride-drill` (autopilot rides every mount: grinds, flip tricks, back flips),
+  `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts;
   takes cover and throws over walls every fourth throw),
   `--drill` (autopilot loops the parkour drill on the +X flank),
   `--bind 127.0.0.1` (host on loopback only, no firewall prompt).
 
 ## In progress
-Milestone 3 (mounts) starting.
+Nothing. Milestone 3 waiting for a human play-test of the feel (speeds, turning, trick
+timing, how easy grinds are to catch).
 
 ## Known bugs / limits
 - Movement is client-authoritative (fine for LAN with friends, not cheat-proof).
@@ -192,7 +234,12 @@ Milestone 3 (mounts) starting.
   are seen holding, then throwing).
 - Taking cover behind a wall taller than 2.6 m: throws curve round its nearer end; there
   is no lean-out-sideways pose yet.
+- Bots don't ride mounts. There are no ramps or quarter pipes yet (Milestone 4 adds a skate
+  park), so the longest tricks (0.8 s+) need the extra air from popping off a rail or
+  dropping off a wall.
+- Mount models are built from simple shapes; the rider's hands and feet line up with the
+  bars, deck and pedals only roughly.
 
 ## Next step
-Milestone 3: mounts (skateboard, BMX, inline skates, longboard, scooter, soap shoes) with
-tricks defined in RON data files.
+Milestone 4: community map loader (folder plus manifest); all base maps get skateable
+walls, grind rails and an open skate park.

@@ -1,0 +1,48 @@
+// Kick scooter. Same inputs as the skateboard (see skateboard.ron). Flips whip the deck
+// round the stem (frame_whip) or spin the bars; grinds put the deck or wheels on the rail.
+(
+    name: "Scooter",
+    kind: Scooter,
+    stance: Forward,
+    stats: (top_speed: 11.0, push: 9.5, turn: 3.8, jump: 8.0, friction: 0.3, grind_speed: 9.0),
+    flips: [
+        (name: "Tailwhip",       input: (dir: None),      secs: 0.45, points: 350, anim: (frame_whip: 1.0)),
+        (name: "Barspin",        input: (dir: Down),      secs: 0.4,  points: 300, anim: (bar_spin: 1.0)),
+        (name: "Double Whip",    input: (dir: Up),        secs: 0.65, points: 650, anim: (frame_whip: 2.0)),
+        (name: "360",            input: (dir: Left),      secs: 0.6,  points: 450, anim: (body_spin: 1.0)),
+        (name: "Briflip",        input: (dir: Right),     secs: 0.6,  points: 550, anim: (board_roll: 1.0, legs: Tuck)),
+        (name: "Heelwhip",       input: (dir: UpLeft),    secs: 0.5,  points: 450, anim: (frame_whip: -1.0, legs: Kick)),
+        (name: "Finger Whip",    input: (dir: UpRight),   secs: 0.55, points: 500, anim: (frame_whip: 1.0, bar_spin: 0.5)),
+        (name: "Whip Bar",       input: (dir: DownLeft),  secs: 0.6,  points: 600, anim: (frame_whip: 1.0, bar_spin: 1.0)),
+        (name: "Scooter Flip",   input: (dir: DownRight), secs: 0.7,  points: 700, anim: (board_pitch: 1.0, legs: Extend)),
+        (name: "Kickless Rewind", input: (dir: None, shift: true), secs: 0.7, points: 750, anim: (frame_whip: -1.0, body_spin: 0.5, legs: Split)),
+    ],
+    grabs: [
+        (name: "No Hander",      input: (dir: None),      secs: 0.4, points: 250, anim: (grab: Some((hand: Both, spot: Skate)), lean: -0.2)),
+        (name: "One Hander",     input: (dir: Down),      secs: 0.35, points: 200, anim: (grab: Some((hand: Left, spot: Bars)), legs: Normal)),
+        (name: "Can-Can",        input: (dir: Up),        secs: 0.45, points: 300, anim: (grab: Some((hand: Both, spot: Bars)), legs: OneFoot)),
+        (name: "Superman",       input: (dir: Left),      secs: 0.55, points: 450, anim: (grab: Some((hand: Both, spot: Bars)), legs: Extend, lean: -0.5)),
+        (name: "Toboggan",       input: (dir: Right),     secs: 0.5, points: 380, anim: (grab: Some((hand: Left, spot: Mid)), legs: Tuck, lean: 0.2)),
+        (name: "Tuck No Hander", input: (dir: UpLeft),    secs: 0.5, points: 420, anim: (grab: Some((hand: Both, spot: Skate)), legs: Tuck)),
+        (name: "Kickless",       input: (dir: UpRight),   secs: 0.5, points: 400, anim: (grab: Some((hand: Both, spot: Bars)), legs: Split)),
+        (name: "Nothing",        input: (dir: DownLeft),  secs: 0.6, points: 600, anim: (grab: Some((hand: Both, spot: Skate)), legs: Split, lean: -0.3)),
+        (name: "Heel Grab",      input: (dir: DownRight), secs: 0.5, points: 380, anim: (grab: Some((hand: Right, spot: Heel)), legs: Tuck)),
+        (name: "Tabletop",       input: (dir: None, shift: true), secs: 0.55, points: 450, anim: (grab: Some((hand: Both, spot: Bars)), legs: Tuck, lean: 0.4)),
+    ],
+    grinds: [
+        (name: "50-50",      input: (dir: None),      points: 200, anim: (angle: 0.0, crouch: 0.4)),
+        (name: "5-0",        input: (dir: Down),      points: 240, anim: (angle: 0.0, tilt: 12.0, crouch: 0.3)),
+        (name: "Nosegrind",  input: (dir: Up),        points: 240, anim: (angle: 0.0, tilt: -12.0, crouch: 0.3)),
+        (name: "Feeble",     input: (dir: Left),      points: 260, anim: (angle: 12.0, tilt: 10.0, crouch: 0.5)),
+        (name: "Smith",      input: (dir: Right),     points: 260, anim: (angle: -12.0, tilt: 10.0, crouch: 0.5)),
+        (name: "Crooked",    input: (dir: UpLeft),    points: 280, anim: (angle: 20.0, tilt: -10.0, crouch: 0.5)),
+        (name: "Overcrook",  input: (dir: UpRight),   points: 300, anim: (angle: -20.0, tilt: -10.0, crouch: 0.5)),
+        (name: "Icepick",    input: (dir: DownLeft),  points: 320, anim: (angle: 0.0, tilt: -30.0, crouch: 0.3)),
+        (name: "Boardslide", input: (dir: DownRight), points: 260, anim: (angle: 90.0, crouch: 0.5)),
+        (name: "Lipslide",   input: (dir: None, shift: true), points: 300, anim: (angle: -90.0, crouch: 0.5)),
+    ],
+    air_flips: [
+        (name: "Front Flip", input: (dir: Up),   secs: 0.75, points: 850, anim: (body_flip: -1.0, legs: Tuck)),
+        (name: "Back Flip",  input: (dir: Down), secs: 0.75, points: 850, anim: (body_flip: 1.0, legs: Tuck)),
+    ],
+)

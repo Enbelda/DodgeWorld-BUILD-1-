@@ -6,6 +6,10 @@
 //! Every few throws it takes cover instead: walks behind a low wall between it and the
 //! enemy, presses F, stays crouched a moment, rises, throws over the wall and leaves.
 //!
+//! With `--ride-drill` it loops a riding drill instead: each lap on the next mount, it
+//! rolls up to the rail on the +X side, ollies onto it holding F to grind, flips off the
+//! end and lands, then (every other lap) ollies again for a back flip.
+//!
 //! With `--drill` it instead loops a parkour drill on the +X flank: wall run along the outer
 //! wall, wall jump across to the panel and wall run on it, then climb the panel, hang from
 //! its ledge (throwing from there if holding a ball), shimmy, climb up on top and drop off.
@@ -15,7 +19,10 @@ use bevy::prelude::*;
 use crate::camera::FollowCamera;
 use crate::parkour;
 use crate::cover::Cover;
-use crate::player::{Autopilot, LocalArena, LocalBody, LocalCover, LocalParkour, LockOn, MoveIntent, Side, FEET_OFFSET};
+use crate::mounts::{Dir, MountKind, TrickInput};
+use crate::player::{
+    Autopilot, LocalArena, LocalBody, LocalCover, LocalParkour, LocalRide, LockOn, MoveIntent, Side, FEET_OFFSET,
+};
 use crate::session::{LocalActions, View};
 use crate::sim::{bot::yaw_toward, Action, BallState, HOLD_HEIGHT};
 
@@ -25,6 +32,19 @@ const PREFERRED_RANGE: f32 = 12.0;
 /// `--drill`: the autopilot runs the parkour drill.
 #[derive(Resource, Default)]
 pub struct ParkourDrill(pub bool);
+
+/// `--ride-drill`: the autopilot runs the riding drill.
+#[derive(Resource, Default)]
+pub struct RideDrill(pub bool);
+
+/// Where the riding drill is.
+#[derive(Default)]
+pub struct RideDrillState {
+    step: u32,
+    t: f32,
+    laps: u32,
+    grinds: u32,
+}
 
 /// Where the parkour drill is.
 #[derive(Default)]
@@ -69,7 +89,8 @@ pub fn drive(
     mut actions: ResMut<LocalActions>,
     mut lock: ResMut<LockOn>,
     mut st: Local<AutoState>,
-    drill_on: Res<ParkourDrill>,
+    (drill_on, ride_on): (Res<ParkourDrill>, Res<RideDrill>),
+    (ride, mut rs): (Res<LocalRide>, Local<RideDrillState>),
     pk: Res<LocalParkour>,
     mut ds: Local<DrillState>,
     arena: Res<LocalArena>,
@@ -83,9 +104,14 @@ pub fn drive(
     let (Some(snap), Some(me)) = (view.snap.as_ref(), view.me()) else { return };
     if !me.alive() {
         ds.step = 0;
+        rs.step = 0;
         return;
     }
     let feet = body.translation - Vec3::Y * FEET_OFFSET;
+    if ride_on.0 {
+        ride_drill(&mut rs, dt, feet, &ride, &mut cam, &mut intent);
+        return;
+    }
     if drill_on.0 {
         let enemy = snap
             .players
@@ -525,4 +551,140 @@ fn cover_routine(
         }
     }
     true
+}
+
+/// One frame of the riding drill on the classic arena's +X rail (x 12, z 6..14). Steps:
+/// 0 pick this lap's mount, 1 roll to the run-up spot, 2 push up the run-up lined up with
+/// the rail, 3 ollie holding F onto it, 4 grind to the end, 5 kickflip (Q) off it and
+/// land, 6 brake, 7 on even laps ollie + R+S back flip and land, then the next lap.
+fn ride_drill(rs: &mut RideDrillState, dt: f32, feet: Vec3, ride: &LocalRide, cam: &mut FollowCamera, intent: &mut MoveIntent) {
+    const RUN_UP: Vec3 = Vec3::new(12.0, 0.0, -4.0);
+    rs.t += dt;
+    // Look down a little so the mount is in view in screenshots.
+    cam.pitch = -0.5;
+    let kind = MountKind::ALL[rs.laps as usize % MountKind::ALL.len()];
+    let r = ride.ride.as_ref();
+    let next = |rs: &mut RideDrillState, why: &str| {
+        info!("autopilot ride: step {} done ({why})", rs.step);
+        rs.step += 1;
+        rs.t = 0.0;
+    };
+    let fail = |rs: &mut RideDrillState, why: &str| {
+        info!("autopilot ride: step {} failed ({why}), starting over", rs.step);
+        rs.step = 0;
+        rs.t = 0.0;
+    };
+    // Steer for a point (camera-relative WASD is world-relative once the camera faces it).
+    let mut aim = |p: Vec3| {
+        let d = Vec3::new(p.x - feet.x, 0.0, p.z - feet.z);
+        if d.length() > 0.05 {
+            cam.yaw = yaw_toward(d);
+            intent.dir = d.normalize();
+        }
+        d.length()
+    };
+    match rs.step {
+        0 => {
+            if r.map(|r| r.mount) != Some(kind) {
+                intent.mount = Some(kind);
+            }
+            if rs.t > 0.2 {
+                next(rs, "picked the mount");
+            }
+        }
+        1 => {
+            let speed = r.map_or(0.0, |r| r.speed);
+            // Go round the rail (it's solid) rather than into it.
+            let by_rail = feet.z > 5.0 && (feet.x - 12.0).abs() < 2.0;
+            let d = aim(if by_rail { Vec3::new(9.3, 0.0, feet.z - 4.0) } else { RUN_UP });
+            let d = if by_rail { d + 10.0 } else { d };
+            if d < 1.5 {
+                // Close: let it roll to a stop instead of circling.
+                intent.dir = Vec3::ZERO;
+                if speed < 1.5 {
+                    next(rs, "at the run-up");
+                }
+            } else if d < 4.0 && speed > 4.0 {
+                intent.dir = -intent.dir; // brake
+            }
+            if rs.t > 20.0 {
+                fail(rs, "could not reach the run-up");
+            }
+        }
+        2 => {
+            // Push up the run-up, steering onto the rail's line.
+            aim(Vec3::new(12.0, 0.0, feet.z + 6.0));
+            if feet.z > 4.2 {
+                next(rs, "lined up");
+            } else if rs.t > 6.0 {
+                fail(rs, "never got going");
+            }
+        }
+        3 => {
+            aim(Vec3::new(12.0, 0.0, feet.z + 6.0));
+            intent.jump = rs.t < 0.02;
+            intent.trick_grind = true;
+            if r.is_some_and(|r| r.grind.is_some()) {
+                rs.grinds += 1;
+                next(rs, "grinding");
+            } else if rs.t > 1.5 {
+                fail(rs, "missed the rail");
+            }
+        }
+        4 => {
+            intent.trick_grind = true;
+            aim(Vec3::new(12.0, 0.0, feet.z + 6.0));
+            if r.is_some_and(|r| r.grind.is_none()) {
+                next(rs, "off the end");
+            } else if rs.t > 4.0 {
+                fail(rs, "stuck on the rail");
+            }
+        }
+        5 => {
+            aim(Vec3::new(12.0, 0.0, feet.z + 6.0));
+            intent.trick_flip = rs.t < 0.02;
+            if rs.t > 0.3 && r.is_some_and(|r| !r.airborne) {
+                next(rs, "landed");
+            } else if rs.t > 3.0 {
+                fail(rs, "never landed");
+            }
+        }
+        6 => {
+            // Brake: pull back.
+            aim(feet + Vec3::NEG_Z);
+            if r.is_some_and(|r| r.speed < 1.0) || rs.t > 2.0 {
+                next(rs, "stopped");
+            }
+        }
+        7 => {
+            if rs.laps % 2 == 1 {
+                rs.step = 9;
+                return;
+            }
+            // Ollie and back flip (R + S) heading back toward the middle.
+            aim(Vec3::new(12.0, 0.0, 0.0));
+            if rs.t > 0.6 {
+                intent.jump = true;
+                next(rs, "ollie for a flip");
+            }
+        }
+        8 => {
+            aim(Vec3::new(12.0, 0.0, 0.0));
+            if rs.t < 0.05 {
+                intent.trick_air_flip = true;
+                intent.trick_keys = TrickInput { dir: Dir::Down, shift: false };
+            }
+            if rs.t > 0.3 && r.is_some_and(|r| !r.airborne) {
+                next(rs, "landed the flip");
+            } else if rs.t > 3.0 {
+                fail(rs, "never landed the flip");
+            }
+        }
+        _ => {
+            rs.laps += 1;
+            info!("autopilot ride: lap {} complete ({:?}, {} grinds so far)", rs.laps, kind, rs.grinds);
+            rs.step = 0;
+            rs.t = 0.0;
+        }
+    }
 }

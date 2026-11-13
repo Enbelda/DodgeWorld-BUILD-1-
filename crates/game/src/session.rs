@@ -185,6 +185,8 @@ fn tick_session(
     facing: Res<crate::player::LocalFacing>,
     parkour: Res<crate::player::LocalParkour>,
     cover: Res<crate::player::LocalCover>,
+    ride: Res<crate::player::LocalRide>,
+    lib: Res<crate::mounts::MountLibrary>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
@@ -193,6 +195,7 @@ fn tick_session(
     // Report where the body faces (a spin turns the body, not the camera).
     let yaw = facing.body_yaw(cam.yaw);
     let mut new_events = Vec::new();
+    let ride_view = ride.ride.as_ref().map(|r| r.view(lib.get(r.mount)));
 
     match session.as_mut() {
         Session::Host(host) => {
@@ -202,6 +205,7 @@ fn tick_session(
             host.sim.set_dash(local, dash.report());
             host.sim.set_parkour(local, parkour.0.pose());
             host.sim.set_cover(local, cover.pose);
+            host.sim.set_ride(local, ride_view);
             for a in actions.0.drain(..) {
                 host.sim.apply(local, a);
             }
@@ -240,7 +244,7 @@ fn tick_session(
             for a in actions.0.drain(..) {
                 net.push_action(a);
             }
-            net.send_update(feet, yaw, trick.0, dash.report(), parkour.0.pose(), cover.pose, now);
+            net.send_update(feet, yaw, trick.0, dash.report(), parkour.0.pose(), cover.pose, ride_view, now);
             if net.receive(now) {
                 if let Some(s) = net.latest.as_mut() {
                     new_events = std::mem::take(&mut s.events);
@@ -280,6 +284,10 @@ fn tick_session(
                 format!("{} got BRICKED by {}!", view.name_of(target), view.name_of(thrower))
             }
             GameEvent::BoomerangBack { owner } => format!("{}'s boomerang came back charged", view.name_of(owner)),
+            GameEvent::Combo { player, points, charged } => {
+                let extra = if charged { " - ball charged!" } else { "" };
+                format!("{} landed a {points}-point combo{extra}", view.name_of(player))
+            }
             GameEvent::MatchStarted => "Match started!".to_string(),
             GameEvent::MatchEnded { winner } => format!("{winner:?} team wins!"),
         };
