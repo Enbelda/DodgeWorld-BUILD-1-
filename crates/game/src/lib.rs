@@ -5,6 +5,7 @@ pub mod autopilot;
 pub mod camera;
 pub mod config;
 pub mod hud;
+pub mod cover;
 pub mod net;
 pub mod parkour;
 pub mod player;
@@ -12,6 +13,7 @@ pub mod render;
 pub mod rig;
 pub mod session;
 pub mod sim;
+pub mod textures;
 
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
@@ -34,6 +36,7 @@ pub fn run(cfg: LaunchConfig) -> Result<(), String> {
         .insert_resource(autopilot::ParkourDrill(cfg.drill))
         .insert_resource(session::View { status, ..default() })
         .add_plugins((
+            textures::TexturesPlugin,
             arena::ArenaPlugin,
             camera::CameraPlugin,
             player::PlayerPlugin,

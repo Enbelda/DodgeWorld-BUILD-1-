@@ -41,6 +41,10 @@ pub const HANG_MIN: f32 = 1.4;
 pub const HANG_REACH: f32 = 2.05;
 /// While hanging the feet are this far below the ledge.
 pub const HANG_DROP: f32 = 2.0;
+/// Hanging with a ball: pulled up so the head looks over the ledge (ball cocked behind it).
+pub const PEEK_DROP: f32 = 1.45;
+/// How fast the body pulls up into / lowers out of the peek (m/s).
+pub const PEEK_SPEED: f32 = 3.5;
 /// Ledges up to this high above the feet are vaulted onto directly.
 pub const VAULT_REACH: f32 = 1.4;
 pub const SHIMMY_SPEED: f32 = 2.2;
@@ -136,6 +140,8 @@ pub struct Input {
     /// Let go of a ledge (Ctrl).
     pub drop: bool,
     pub grounded: bool,
+    /// Holding a ball while hanging: pull up and look over the ledge.
+    pub peek: bool,
 }
 
 /// What the movement system should do this frame.
@@ -162,6 +168,12 @@ impl Out {
     fn normal() -> Self {
         Out { drive: Drive::Normal, used_jump: false, event: None }
     }
+
+    /// Touching a wall (starting a wall run, climb, hang or vault, or kicking off one)
+    /// refills the air jump and both dashes, so moves chain smoothly.
+    pub fn refresh(&self) -> bool {
+        matches!(self.event, Some("wall run" | "wall jump" | "wall climb" | "ledge hang" | "vault" | "climb up"))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -172,6 +184,8 @@ pub struct Parkour {
     used_climb: Option<usize>,
     /// A ledge just let go of, and for how much longer it can't be grabbed.
     ignore: Option<(usize, f32)>,
+    /// Pulled up to look over the ledge (holding a ball).
+    peek: bool,
 }
 
 impl Parkour {
@@ -224,6 +238,7 @@ impl Parkour {
                 self.ignore = None;
             }
         }
+        self.peek = i.peek;
         let attached = matches!(self.state, State::Hang { .. } | State::Mantle { .. });
         if i.grounded && !attached {
             self.used_run = None;
@@ -279,7 +294,7 @@ impl Parkour {
     fn begin_hang(&mut self, m: &mut Motion, feet: Vec3, c: &Contact) -> Out {
         self.state = State::Hang { wall: c.wall, normal: c.normal };
         *m = Motion { vel_y: 0.0, push: Vec3::ZERO, air_jumps: crate::player::AIR_JUMPS };
-        Out { drive: Drive::Place(hang_point(feet, c)), used_jump: false, event: Some("ledge hang") }
+        Out { drive: Drive::Place(hang_point(feet, c, HANG_DROP)), used_jump: false, event: Some("ledge hang") }
     }
 
     fn begin_mantle(&mut self, m: &mut Motion, feet: Vec3, c: &Contact, event: &'static str) -> Out {
@@ -370,9 +385,10 @@ impl Parkour {
             let out = self.begin_mantle(m, feet, &c, "climb up");
             return Out { used_jump: true, ..out };
         }
-        // Shimmy along the ledge, staying on it.
+        // Shimmy along the ledge, staying on it (not while peeking over it to throw).
         let along = c.along();
-        let moved = feet + along * i.dir.dot(along) * SHIMMY_SPEED * dt;
+        let shimmy = if self.peek { 0.0 } else { SHIMMY_SPEED };
+        let moved = feet + along * i.dir.dot(along) * shimmy * dt;
         let edge = BODY_RADIUS * 0.6;
         let (lo, hi) = (c.span.0 + edge, c.span.1 - edge);
         let moved = if normal.x != 0.0 {
@@ -380,7 +396,11 @@ impl Parkour {
         } else {
             Vec3::new(moved.x.clamp(lo, hi.max(lo)), moved.y, moved.z)
         };
-        Out { drive: Drive::Place(hang_point(moved, &c)), used_jump: false, event: None }
+        // Ease up into the peek (or back down), instead of snapping.
+        let want = hang_point(moved, &c, if self.peek { PEEK_DROP } else { HANG_DROP });
+        let step = PEEK_SPEED * dt;
+        let y = feet.y + (want.y - feet.y).clamp(-step, step);
+        Out { drive: Drive::Place(Vec3::new(want.x, y, want.z)), used_jump: false, event: None }
     }
 
     fn mantle(&mut self, m: &mut Motion, dt: f32, from: Vec3, to: Vec3, t: f32) -> Out {
@@ -392,10 +412,11 @@ impl Parkour {
     }
 }
 
-/// Where the feet go while hanging from `c` (horizontally where `feet` is along the face).
-fn hang_point(feet: Vec3, c: &Contact) -> Vec3 {
+/// Where the feet go while hanging from `c` (horizontally where `feet` is along the face),
+/// `drop` below the ledge.
+fn hang_point(feet: Vec3, c: &Contact, drop: f32) -> Vec3 {
     let on_face = if c.normal.x != 0.0 { Vec3::new(c.face.x, 0.0, feet.z) } else { Vec3::new(feet.x, 0.0, c.face.z) };
-    on_face + c.normal * (BODY_RADIUS + 0.03) + Vec3::Y * (c.top - HANG_DROP)
+    on_face + c.normal * (BODY_RADIUS + 0.03) + Vec3::Y * (c.top - drop)
 }
 
 /// Standing spot on top of the box behind face `c`.
@@ -434,11 +455,19 @@ mod tests {
         feet: Vec3,
         solids: Vec<Aabb>,
         events: Vec<&'static str>,
+        peek: bool,
     }
 
     impl Sim {
         fn new(feet: Vec3) -> Self {
-            Sim { pk: Parkour::default(), m: Motion::default(), feet, solids: layout::solids(), events: vec![] }
+            Sim {
+                pk: Parkour::default(),
+                m: Motion::default(),
+                feet,
+                solids: layout::solids(layout::ArenaId::Classic),
+                events: vec![],
+                peek: false,
+            }
         }
 
         fn ground_under(&self, p: Vec3) -> f32 {
@@ -476,7 +505,7 @@ mod tests {
 
         fn frame(&mut self, dir: Vec3, forward: Vec3, jump: bool, drop: bool) {
             let grounded = self.grounded();
-            let i = Input { dir: dir.normalize_or_zero(), forward, jump, drop, grounded };
+            let i = Input { dir: dir.normalize_or_zero(), forward, jump, drop, grounded, peek: self.peek };
             let out = self.pk.update(&mut self.m, &i, self.feet, DT, &self.solids);
             if let Some(e) = out.event {
                 self.events.push(e);
@@ -507,7 +536,7 @@ mod tests {
 
     /// The tall panel on the +X flank (x 15.2..15.8, z -4..4, 5.5 m high).
     fn panel() -> Aabb {
-        layout::solids().into_iter().find(|b| b.min.x > 14.0 && b.max.y > 4.0 && b.max.x < 17.0).expect("panel")
+        layout::solids(layout::ArenaId::Classic).into_iter().find(|b| b.min.x > 14.0 && b.max.y > 4.0 && b.max.x < 17.0).expect("panel")
     }
 
     #[test]
@@ -669,5 +698,38 @@ mod tests {
         let mid = mantle_point(from, to, 0.55);
         assert!((mid.y - 3.0).abs() < 1e-4 && mid.x == 0.0, "up first");
         assert_eq!(mantle_point(from, to, 1.0), to);
+    }
+
+    #[test]
+    fn holding_a_ball_pulls_up_to_look_over_the_ledge() {
+        let pan = panel();
+        let mut s = Sim::new(Vec3::new(pan.max.x + BODY_RADIUS + 0.05, pan.max.y - 1.8, 0.0));
+        s.m.vel_y = -1.0;
+        s.run(0.1, Vec3::NEG_X, Vec3::NEG_X);
+        assert_eq!(s.pk.pose(), ParkourPose::Hang);
+        let low = s.feet.y;
+        assert!((pan.max.y - low - HANG_DROP).abs() < 0.05, "hangs at arm's length");
+        s.peek = true;
+        s.run(0.4, Vec3::ZERO, Vec3::NEG_X);
+        assert!((pan.max.y - s.feet.y - PEEK_DROP).abs() < 0.05, "pulled up: {}", pan.max.y - s.feet.y);
+        // Head (about 1.7 m above the feet) now clears the ledge.
+        assert!(s.feet.y + 1.7 > pan.max.y);
+        // No shimmying while peeking to throw.
+        let z = s.feet.z;
+        s.run(0.3, Vec3::Z, Vec3::NEG_X);
+        assert!((s.feet.z - z).abs() < 1e-4);
+        s.peek = false;
+        s.run(0.4, Vec3::ZERO, Vec3::NEG_X);
+        assert!((pan.max.y - s.feet.y - HANG_DROP).abs() < 0.05, "back down");
+    }
+
+    #[test]
+    fn wall_moves_refresh_jumps_and_dashes() {
+        let o = |e| Out { drive: Drive::Normal, used_jump: false, event: Some(e) };
+        for e in ["wall run", "wall jump", "ledge hang", "vault", "climb up", "wall climb"] {
+            assert!(o(e).refresh(), "{e}");
+        }
+        assert!(!o("let go").refresh());
+        assert!(!Out::normal().refresh());
     }
 }

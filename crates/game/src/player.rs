@@ -1,9 +1,12 @@
 //! The local player's body (Rapier character controller) and combat input.
 //!
 //! Controls: WASD move, Shift sprint, Ctrl dash (tackles), Space jump (again in the air to
-//! double jump with a flip), hold Left Mouse to charge (locks the nearest enemy while charging)
-//! and release to throw, hold Q / E while throwing to curve, F to lob, Right Mouse to catch
-//! (time it), Tab / Middle Mouse while charging to switch target.
+//! double jump with a flip), hold Left Mouse to charge (locks the enemy nearest the crosshair, else the nearest one;
+//! move the mouse toward another enemy while charging to switch, or Tab / Middle Mouse)
+//! and release to throw, hold Q / E while throwing to curve, F while charging to lob,
+//! Right Mouse to catch (time it).
+//! Cover (see `cover.rs`): F next to a waist-high wall to crouch behind it, A/D to slide,
+//! charge to rise and throw over it; F again or sprint, jump or dash to leave.
 //! Parkour (see `parkour.rs`): run along a tall wall in the air to wall run, push into it to
 //! climb, grab ledges at hand height, Space to climb up / jump off, Ctrl to let go.
 //! In the air: Q / E spin the body 180 left / right (the camera stays put); W+Q/E front flip,
@@ -13,12 +16,16 @@
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
-use crate::camera::{CursorLocked, FollowCamera};
+use bevy::input::mouse::AccumulatedMouseMotion;
+
+use crate::camera::{CameraShake, CursorLocked, FollowCamera};
+use crate::cover::{self, Cover};
 use crate::parkour::{self, Drive, Parkour};
 use crate::session::{LocalActions, LocalTrick, View};
 use crate::sim::bot::yaw_toward;
 use crate::sim::{
-    layout, Action, PlayerId, TrickKind, TrickState, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT, LOCK_RANGE,
+    layout, Action, ArenaId, GameEvent, PlayerId, TrickKind, TrickState, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT,
+    LOCK_RANGE, RECOIL_DECAY,
 };
 
 const MOVE_SPEED: f32 = 7.0;
@@ -44,7 +51,23 @@ const FLIP_INPUT: f32 = 0.3;
 /// Lock-on picks the enemy closest to the crosshair inside this cone (radians).
 pub const LOCK_CONE: f32 = 0.6;
 /// How quickly the camera turns toward a locked target (higher = snappier).
-const LOCK_CAMERA_RATE: f32 = 8.0;
+const LOCK_CAMERA_RATE: f32 = 5.0;
+/// The camera stops pulling toward the target for this long after the mouse moves, so the
+/// mouse can swing over to another enemy.
+const LOCK_MOUSE_GRACE: f32 = 0.35;
+/// Moving the mouse switches the lock to an enemy at least this much closer (radians) to
+/// the crosshair than the current one.
+pub const LOCK_SWITCH_MARGIN: f32 = 0.1;
+/// Mouse movement (pixels per frame) that counts as aiming.
+const MOUSE_AIM_PIXELS: f32 = 1.5;
+/// Jump pressed this long before landing still jumps on landing; walking off a ledge you
+/// can still jump from the ground for this long.
+pub const JUMP_BUFFER_SECS: f32 = 0.12;
+pub const COYOTE_SECS: f32 = 0.12;
+/// Part of a dash's speed you keep when it ends in the air.
+pub const DASH_CARRY: f32 = 0.3;
+/// How quickly the body turns to face a wall during parkour / cover.
+const WALL_FACE_RATE: f32 = 16.0;
 /// Seconds of holding the throw button for a full-power throw.
 pub const FULL_CHARGE_SECS: f32 = 1.0;
 /// The body's origin sits at the capsule centre, this far above the feet.
@@ -58,8 +81,41 @@ pub struct LocalBody {
     pub sprint_jump: bool,
     /// Last host teleport counter we obeyed.
     pub teleports: Option<u32>,
-    /// Horizontal momentum from wall jumps.
+    /// Horizontal momentum from wall jumps (and the end of an air dash).
     pub push: Vec3,
+    /// Push-back from catching a ball (fades on the ground too).
+    pub recoil: Vec3,
+    /// Seconds since we were last on the ground (coyote time).
+    pub air_time: f32,
+    /// Seconds left on a buffered jump press.
+    pub jump_buffer: f32,
+    /// Mid-dash last frame (to carry momentum out of it).
+    pub was_dashing: bool,
+}
+
+/// The local player's cover state.
+#[derive(Resource, Default)]
+pub struct LocalCover {
+    pub cover: Option<Cover>,
+    /// Crouched behind it right now (a smaller target), or risen up to throw.
+    pub crouched: bool,
+    pub pose: crate::sim::CoverPose,
+    /// F was used for cover this frame (so it doesn't also lob).
+    pub toggled: bool,
+}
+
+/// The arena the local body moves in (follows the host's choice).
+#[derive(Resource, Default)]
+pub struct LocalArena {
+    pub arena: Option<ArenaId>,
+    pub solids: Vec<layout::Aabb>,
+}
+
+/// Seconds since the mouse last moved (lets the mouse override lock-on camera pull).
+#[derive(Resource, Default)]
+pub struct MouseAim {
+    pub since_move: f32,
+    pub moved: bool,
 }
 
 /// The local player's parkour state.
@@ -85,6 +141,10 @@ pub struct MoveIntent {
     pub dash: bool,
     /// Charging or catching: the body turns back to face where the camera looks.
     pub face_camera: bool,
+    /// F pressed (not while charging): take / leave cover.
+    pub cover: bool,
+    /// Charging a throw (stands up in cover).
+    pub aiming: bool,
 }
 
 /// How far the body is turned away from the camera's yaw (a spin turns the body only).
@@ -160,6 +220,12 @@ impl LocalDash {
         self.active > 0.0
     }
 
+    /// Both charges back, ready at once (touching a wall during parkour).
+    pub fn refill(&mut self) {
+        self.charges = DASH_CHARGES;
+        self.since_last = self.since_last.max(DASH_GAP);
+    }
+
     /// What the host needs: the dash number while mid-dash.
     pub fn report(&self) -> Option<u32> {
         self.dashing().then_some(self.seq)
@@ -197,10 +263,14 @@ impl Plugin for PlayerPlugin {
             .init_resource::<LocalDash>()
             .init_resource::<LocalFacing>()
             .init_resource::<LocalParkour>()
+            .init_resource::<LocalCover>()
+            .init_resource::<LocalArena>()
+            .init_resource::<MouseAim>()
             .add_systems(Startup, spawn_local_body)
             .add_systems(
                 Update,
                 (
+                    track_arena,
                     obey_teleports,
                     lock_input,
                     keyboard_intent,
@@ -222,7 +292,7 @@ fn spawn_local_body(mut commands: Commands) {
     commands.spawn((
         LocalBody::default(),
         Visibility::default(),
-        Transform::from_translation(layout::spawn_point(true, 0) + Vec3::Y * FEET_OFFSET),
+        Transform::from_translation(layout::spawn_point(ArenaId::Classic, true, 0) + Vec3::Y * FEET_OFFSET),
         Collider::capsule_y(half_segment, BODY_RADIUS),
         KinematicCharacterController {
             offset: CharacterLength::Absolute(0.02),
@@ -325,6 +395,31 @@ pub fn pick_lock_target(enemies: &[(PlayerId, Vec3)], from: Vec3, forward: Vec3)
         .map(|(_, id)| id)
 }
 
+/// Moving the mouse while charging: the enemy now clearly closer to the crosshair than
+/// `current` (by `LOCK_SWITCH_MARGIN`), inside the lock cone, or `None` to keep the lock.
+pub fn mouse_retarget(
+    enemies: &[(PlayerId, Vec3)],
+    current: Option<PlayerId>,
+    from: Vec3,
+    forward: Vec3,
+) -> Option<PlayerId> {
+    let angle = |p: Vec3| forward.angle_between(p - from);
+    let cur = current.and_then(|c| enemies.iter().find(|(id, _)| *id == c)).map_or(f32::MAX, |(_, p)| angle(*p));
+    enemies
+        .iter()
+        .filter(|(id, pos)| Some(*id) != current && pos.distance(from) <= LOCK_RANGE)
+        .map(|&(id, pos)| (angle(pos), id))
+        .filter(|(a, _)| *a <= LOCK_CONE && *a + LOCK_SWITCH_MARGIN < cur)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, id)| id)
+}
+
+/// Starting a charge: the enemy nearest the crosshair if one is in the cone, else the
+/// nearest enemy in range.
+pub fn charge_target(enemies: &[(PlayerId, Vec3)], eye: Vec3, forward: Vec3, feet: Vec3) -> Option<PlayerId> {
+    pick_lock_target(enemies, eye, forward).or_else(|| nearest_enemy(enemies, feet))
+}
+
 /// Shortest-way blend between two angles.
 fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
     let mut d = (to - from) % std::f32::consts::TAU;
@@ -337,7 +432,12 @@ fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
 }
 
 /// Snap to the host's position whenever it respawns us.
-fn obey_teleports(view: Res<View>, mut parkour: ResMut<LocalParkour>, body: Single<(&mut LocalBody, &mut Transform)>) {
+fn obey_teleports(
+    view: Res<View>,
+    mut parkour: ResMut<LocalParkour>,
+    mut cover: ResMut<LocalCover>,
+    body: Single<(&mut LocalBody, &mut Transform)>,
+) {
     let Some(me) = view.me() else { return };
     let (mut b, mut tf) = body.into_inner();
     if b.teleports != Some(me.teleports) {
@@ -345,23 +445,39 @@ fn obey_teleports(view: Res<View>, mut parkour: ResMut<LocalParkour>, body: Sing
         tf.translation = Vec3::from_array(me.pos) + Vec3::Y * FEET_OFFSET;
         b.vel_y = 0.0;
         b.push = Vec3::ZERO;
+        b.recoil = Vec3::ZERO;
         parkour.0.reset();
+        cover.cover = None;
+    }
+}
+
+/// Keep the local copy of the arena's boxes in step with the host's arena.
+fn track_arena(view: Res<View>, mut local: ResMut<LocalArena>) {
+    let arena = view.snap.as_ref().map_or(ArenaId::Classic, |s| s.arena);
+    if local.arena != Some(arena) {
+        local.arena = Some(arena);
+        local.solids = layout::solids(arena);
     }
 }
 
 /// Tab / middle mouse toggles lock-on. Drops the lock when the target is gone or dead.
 #[allow(clippy::too_many_arguments)]
 fn lock_input(
+    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
     locked: Res<CursorLocked>,
     auto: Res<Autopilot>,
     view: Res<View>,
     charge: Res<Charge>,
+    mut aim: ResMut<MouseAim>,
     mut lock: ResMut<LockOn>,
     mut actions: ResMut<LocalActions>,
     cam: Single<&Transform, With<FollowCamera>>,
 ) {
+    aim.moved = locked.0 && !auto.0 && motion.delta.length() > MOUSE_AIM_PIXELS;
+    aim.since_move = if aim.moved { 0.0 } else { aim.since_move + time.delta_secs() };
     let (Some(snap), Some(me)) = (view.snap.as_ref(), view.me()) else { return };
     let enemies: Vec<(PlayerId, Vec3)> = snap
         .players
@@ -375,9 +491,20 @@ fn lock_input(
             actions.0.push(Action::Lock { target: None });
         }
     }
-    // Tab / middle mouse while charging switches to another enemy.
+    if auto.0 || !locked.0 || !me.alive() || charge.started.is_none() {
+        return;
+    }
+    // Swinging the mouse toward another enemy while charging moves the lock to them.
+    if aim.moved {
+        if let Some(t) = mouse_retarget(&enemies, lock.0, cam.translation, *cam.forward()) {
+            lock.0 = Some(t);
+            actions.0.push(Action::Lock { target: Some(t) });
+            return;
+        }
+    }
+    // Tab / middle mouse while charging cycles to the next enemy.
     let pressed = keys.just_pressed(KeyCode::Tab) || mouse.just_pressed(MouseButton::Middle);
-    if auto.0 || !locked.0 || !pressed || !me.alive() || charge.started.is_none() {
+    if !pressed {
         return;
     }
     let target = next_target(&enemies, lock.0, cam.translation, *cam.forward());
@@ -387,14 +514,19 @@ fn lock_input(
     }
 }
 
-/// While locked on, the camera turns toward the target (the mouse still nudges it).
+/// While locked on, the camera turns toward the target, except right after the mouse moved
+/// (so you can swing over to another enemy).
 fn lock_camera(
     time: Res<Time>,
     view: Res<View>,
     lock: Res<LockOn>,
+    aim: Res<MouseAim>,
     body: Single<&Transform, With<LocalBody>>,
     mut cam: Single<&mut FollowCamera>,
 ) {
+    if aim.since_move < LOCK_MOUSE_GRACE {
+        return;
+    }
     let (Some(snap), Some(t)) = (view.snap.as_ref(), lock.0) else { return };
     let Some(target) = snap.players.iter().find(|p| p.id == t) else { return };
     let chest = Vec3::from_array(target.pos) + Vec3::Y * 1.0;
@@ -425,8 +557,10 @@ fn keyboard_intent(
     intent.sprint = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     intent.dash = keys.just_pressed(KeyCode::ControlLeft) || keys.just_pressed(KeyCode::ControlRight);
     intent.face_camera = mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right);
-    // While charging a throw, Q/E curve the ball instead of doing tricks.
+    // While charging a throw, Q/E curve the ball instead of doing tricks, and F lobs.
     let charging = mouse.pressed(MouseButton::Left);
+    intent.aiming = charging;
+    intent.cover = keys.just_pressed(KeyCode::KeyF) && !charging;
     intent.trick = match (keys.just_pressed(KeyCode::KeyQ), keys.just_pressed(KeyCode::KeyE)) {
         (true, false) if !charging => Some(Side::Left),
         (false, true) if !charging => Some(Side::Right),
@@ -443,7 +577,9 @@ pub fn move_local_body(
     mut dash: ResMut<LocalDash>,
     mut facing: ResMut<LocalFacing>,
     mut parkour: ResMut<LocalParkour>,
-    mut solids: Local<Vec<layout::Aabb>>,
+    mut cover: ResMut<LocalCover>,
+    mut shake: ResMut<CameraShake>,
+    arena: Res<LocalArena>,
     cam: Single<&FollowCamera>,
     body: Single<(
         &mut LocalBody,
@@ -457,14 +593,25 @@ pub fn move_local_body(
     let me = view.me();
     tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
     dash.tick(dt);
-    if solids.is_empty() {
-        *solids = layout::solids();
+    let solids = &arena.solids;
+    cover.toggled = false;
+    cover.crouched = false;
+    cover.pose = crate::sim::CoverPose::None;
+    // Catching a ball shoves us back along its flight.
+    for e in &view.events {
+        if let GameEvent::Caught { catcher, push, perfect, .. } = e {
+            if Some(*catcher) == view.local {
+                b.recoil = Vec3::from_array(*push);
+                shake.add(if *perfect { 0.55 } else { 0.4 });
+            }
+        }
     }
     if !me.is_none_or(|m| m.alive()) {
         controller.translation = None;
         trick.0 = None;
         dash.active = 0.0;
         parkour.0.reset();
+        cover.cover = None;
         return;
     }
     // Slimed, knocked flat or launched: the host owns our position.
@@ -475,7 +622,9 @@ pub fn move_local_body(
             info!("parkour: knocked off the wall");
         }
         parkour.0.reset();
+        cover.cover = None;
         b.push = Vec3::ZERO;
+        b.recoil = Vec3::ZERO;
         let target = Vec3::from_array(m.pos) + Vec3::Y * FEET_OFFSET;
         tf.translation = tf.translation.lerp(target, 1.0 - (-20.0 * dt).exp());
         controller.translation = None;
@@ -488,6 +637,67 @@ pub fn move_local_body(
         b.vel_y = 0.0;
         b.air_jumps = AIR_JUMPS;
         b.sprint_jump = false;
+        b.air_time = 0.0;
+    } else {
+        b.air_time += dt;
+    }
+    b.jump_buffer = if intent.jump { JUMP_BUFFER_SECS } else { (b.jump_buffer - dt).max(0.0) };
+    let recoil = b.recoil;
+    b.recoil *= (-RECOIL_DECAY * dt).exp();
+    if b.recoil.length() < 0.2 {
+        b.recoil = Vec3::ZERO;
+    }
+    let feet = tf.translation - Vec3::Y * FEET_OFFSET;
+
+    // F: take cover behind the wall we're next to, or leave it.
+    if intent.cover {
+        if cover.cover.take().is_some() {
+            cover.toggled = true;
+            info!("cover: left (F)");
+        } else if grounded && parkour.0.is_free() {
+            if let Some(c) = Cover::find(feet, solids) {
+                info!("cover: taken (wall {} m high)", (c.top - feet.y).round());
+                cover.cover = Some(c);
+                cover.toggled = true;
+                trick.0 = None;
+            }
+        }
+    }
+    if cover.cover.is_some() {
+        let leave = if intent.sprint && intent.dir.length_squared() > 0.01 {
+            Some("sprint")
+        } else if intent.jump {
+            Some("jump")
+        } else if intent.dash {
+            Some("dash")
+        } else if !grounded {
+            Some("fell")
+        } else {
+            None
+        };
+        if let Some(why) = leave {
+            info!("cover: left ({why})");
+            cover.cover = None;
+        }
+    }
+    if let Some(c) = cover.cover.as_mut() {
+        match c.slide(feet, intent.dir.normalize_or_zero(), dt, solids) {
+            Some(p) => {
+                let crouched = c.crouched(intent.aiming);
+                let wall_yaw = yaw_toward(-c.normal) - cam.yaw;
+                cover.crouched = crouched;
+                cover.pose = if crouched { crate::sim::CoverPose::Crouched } else { crate::sim::CoverPose::Up };
+                // Facing the wall (peeking over it), or the camera while aiming.
+                let want = if intent.face_camera { 0.0 } else { wall_yaw };
+                facing.0 = lerp_angle(facing.0, want, 1.0 - (-WALL_FACE_RATE * dt).exp());
+                tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
+                b.vel_y = 0.0;
+                b.push = Vec3::ZERO;
+                controller.translation = Some(p - feet + recoil * dt * 0.3 + Vec3::NEG_Y * 0.05);
+                return;
+            }
+            None => cover.cover = None,
+        }
     }
     // Ctrl: a quick burst in the movement direction (or straight ahead), ground or air.
     // (While hanging from a ledge Ctrl lets go instead.)
@@ -503,14 +713,18 @@ pub fn move_local_body(
     }
     if dash.dashing() {
         b.vel_y = 0.0;
-        controller.translation = Some(dash.velocity * dt);
+        b.was_dashing = true;
+        controller.translation = Some((dash.velocity + recoil) * dt);
         return;
+    }
+    // An air dash flows on into the fall instead of stopping dead.
+    if std::mem::take(&mut b.was_dashing) && !grounded {
+        b.push = dash.velocity * DASH_CARRY;
     }
     let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
     let fwd_amount = intent.dir.normalize_or_zero().dot(forward);
 
     // Parkour: wall run, climb, hang, vault / climb up.
-    let feet = tf.translation - Vec3::Y * FEET_OFFSET;
     let mut motion = parkour::Motion { vel_y: b.vel_y, push: b.push, air_jumps: b.air_jumps };
     let input = parkour::Input {
         dir: intent.dir.normalize_or_zero(),
@@ -518,16 +732,27 @@ pub fn move_local_body(
         jump: intent.jump,
         drop: intent.dash,
         grounded,
+        // Holding a ball while hanging: pull up and look over the ledge.
+        peek: me.is_some_and(|m| m.holding),
     };
-    let out = parkour.0.update(&mut motion, &input, feet, dt, &solids);
+    let out = parkour.0.update(&mut motion, &input, feet, dt, solids);
     (b.vel_y, b.push, b.air_jumps) = (motion.vel_y, motion.push, motion.air_jumps);
     if let Some(e) = out.event {
         info!("parkour: {e}");
     }
-    // On a wall the body faces along it / into it, unless aiming (throw while hanging).
+    // Touching a wall gives back the double jump and both dashes, so moves chain.
+    if out.refresh() {
+        b.air_jumps = AIR_JUMPS;
+        dash.refill();
+    }
+    if out.used_jump {
+        b.jump_buffer = 0.0;
+    }
+    // On a wall the body turns to face along it / into it, unless aiming (throw while hanging).
     if let Some(face) = parkour.0.facing() {
         trick.0 = None;
-        facing.0 = if intent.face_camera { 0.0 } else { yaw_toward(face) - cam.yaw };
+        let want = if intent.face_camera { 0.0 } else { yaw_toward(face) - cam.yaw };
+        facing.0 = lerp_angle(facing.0, want, 1.0 - (-WALL_FACE_RATE * dt).exp());
         tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
     }
     match out.drive {
@@ -543,14 +768,20 @@ pub fn move_local_body(
         Drive::Normal => {}
     }
 
-    if intent.jump && !out.used_jump {
-        if let Some((vy, left)) = try_jump(grounded, b.air_jumps) {
+    // A jump pressed just before landing fires on landing; just after walking off a ledge
+    // it still counts as a ground jump.
+    let wants_jump = (intent.jump || (grounded && b.jump_buffer > 0.0)) && !out.used_jump;
+    let on_ground = grounded || (b.air_time < COYOTE_SECS && b.vel_y <= 0.0 && b.air_jumps == AIR_JUMPS);
+    if wants_jump {
+        if let Some((vy, left)) = try_jump(on_ground, b.air_jumps) {
             b.vel_y = vy;
             b.air_jumps = left;
-            if grounded {
+            b.jump_buffer = 0.0;
+            b.air_time = COYOTE_SECS;
+            if on_ground {
                 b.sprint_jump = intent.sprint;
             }
-            if !grounded {
+            if !on_ground {
                 // The second jump flips: forward or backward with the movement.
                 trick.0 = Some(TrickState { kind: double_jump_flip(fwd_amount), progress: 0.0 });
             }
@@ -569,8 +800,8 @@ pub fn move_local_body(
 
     b.vel_y -= GRAVITY * dt;
     let speed = MOVE_SPEED * move_multiplier(intent.sprint, !grounded && b.sprint_jump);
-    // Wall-jump momentum carries you across, fading in the air.
-    let flat = intent.dir.normalize_or_zero() * speed + b.push;
+    // Wall-jump momentum carries you across, fading in the air; a catch shoves you back.
+    let flat = intent.dir.normalize_or_zero() * speed + b.push + recoil;
     b.push = if grounded { Vec3::ZERO } else { b.push * (-parkour::PUSH_DECAY * dt).exp() };
     controller.translation = Some(Vec3::new(flat.x, b.vel_y, flat.z) * dt);
 }
@@ -614,6 +845,9 @@ fn combat_input(
     mut lock: ResMut<LockOn>,
     mut charge: ResMut<Charge>,
     mut actions: ResMut<LocalActions>,
+    mut cover: ResMut<LocalCover>,
+    mut shake: ResMut<CameraShake>,
+    arena: Res<LocalArena>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&Transform, (With<FollowCamera>, Without<LocalBody>)>,
     follow: Single<&FollowCamera>,
@@ -643,20 +877,27 @@ fn combat_input(
     // Aim at the locked target, otherwise where the crosshair points (40 m out).
     let feet = body.translation - Vec3::Y * FEET_OFFSET;
     let forward = Vec3::new(-follow.yaw.sin(), 0.0, -follow.yaw.cos());
-    let hold = feet + Vec3::Y * HOLD_HEIGHT + forward * 0.45;
+    // Risen up out of cover the ball comes from over the wall.
+    let hold_h = if cover.cover.is_some() { crate::sim::COVER_HOLD_HEIGHT } else { HOLD_HEIGHT };
+    let hold = feet + Vec3::Y * hold_h + forward * 0.45;
     let locked_target = lock
         .0
         .and_then(|t| view.snap.as_ref()?.players.iter().find(|p| p.id == t))
         .map(|p| Vec3::from_array(p.pos) + Vec3::Y * 1.0);
     let target = locked_target.unwrap_or(cam.translation + cam.forward() * 40.0);
-    let aim = (target - hold).normalize_or(forward).to_array();
-    let curve = match (keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE)) {
+    let mut curve = match (keys.pressed(KeyCode::KeyQ), keys.pressed(KeyCode::KeyE)) {
         (true, false) => -1.0,
         (false, true) => 1.0,
         _ => 0.0,
     };
+    let (aim_v, cover_curve) = cover_throw(cover.cover.as_ref(), &arena.solids, feet, hold, target);
+    let aim = aim_v.normalize_or(forward).to_array();
+    if curve == 0.0 {
+        curve = cover_curve;
+    }
 
-    if keys.just_pressed(KeyCode::KeyF) {
+    // F lobs (while charging, or when it wasn't used to take / leave cover).
+    if keys.just_pressed(KeyCode::KeyF) && (charge.started.is_some() || !cover.toggled) {
         actions.0.push(Action::Throw { aim, charge: 0.0, curve: 0.0, lob: true });
         charge.started = None;
         release_lock(&mut lock, &mut actions);
@@ -675,33 +916,84 @@ fn combat_input(
             .map(|p| (Vec3::from_array(p.pos) + Vec3::Y * 1.0 - hold).normalize_or(forward).to_array())
             .unwrap_or(aim);
         actions.0.push(Action::Throw { aim, charge: 1.0, curve, lob: false });
+        threw(&mut cover, &mut shake, 1.0);
         charge.started = None;
         release_lock(&mut lock, &mut actions);
         return;
     }
     if mouse.just_pressed(MouseButton::Left) {
         charge.started = Some(now);
-        // Starting a charge locks on to the nearest enemy.
-        lock_nearest(&view, me, feet, &mut lock, &mut actions);
+        // Starting a charge locks on to the enemy under the crosshair (else the nearest).
+        lock_for_charge(&view, me, cam.translation, *cam.forward(), feet, &mut lock, &mut actions);
     }
     if mouse.just_released(MouseButton::Left) {
         let amount = charge.amount(now).unwrap_or(0.0);
         actions.0.push(Action::Throw { aim, charge: amount, curve, lob: false });
+        threw(&mut cover, &mut shake, amount);
         charge.started = None;
         release_lock(&mut lock, &mut actions);
     }
 }
 
+/// After a throw: stay up in cover a moment, and kick the camera with the throw's power.
+fn threw(cover: &mut LocalCover, shake: &mut CameraShake, power: f32) {
+    if let Some(c) = cover.cover.as_mut() {
+        c.popped_up();
+        // Report risen up this frame already, so the host throws from over the wall.
+        cover.crouched = false;
+        cover.pose = crate::sim::CoverPose::Up;
+    }
+    shake.add(0.12 + 0.2 * power);
+}
+
+/// Aim (unnormalised) and curve for a throw at `target`, adjusted when throwing from cover:
+/// over a low wall the aim is tilted up just enough to clear it; from behind a tall wall the
+/// ball curves around its nearer end (curved throws go round cover to their target).
+pub fn cover_throw(cover: Option<&Cover>, solids: &[layout::Aabb], feet: Vec3, hold: Vec3, target: Vec3) -> (Vec3, f32) {
+    let straight = target - hold;
+    let Some(c) = cover else { return (straight, 0.0) };
+    let Some(wall) = solids.get(c.wall) else { return (straight, 0.0) };
+    if !cover::blocked(hold, target, std::slice::from_ref(wall)) {
+        return (straight, 0.0);
+    }
+    if c.is_low(feet) {
+        (cover::clear_aim(hold, target, wall), 0.0)
+    } else {
+        (straight, c.curve_around(feet, straight))
+    }
+}
+
 /// Lock on to the nearest living enemy, if one is in range.
 fn lock_nearest(view: &View, me: &crate::sim::PlayerView, feet: Vec3, lock: &mut LockOn, actions: &mut LocalActions) {
-    let enemies: Vec<(PlayerId, Vec3)> = view
-        .snap
+    let enemies = enemy_chests(view, me);
+    if let Some(t) = nearest_enemy(&enemies, feet) {
+        lock.0 = Some(t);
+        actions.0.push(Action::Lock { target: Some(t) });
+    }
+}
+
+/// Living enemies' chest positions.
+fn enemy_chests(view: &View, me: &crate::sim::PlayerView) -> Vec<(PlayerId, Vec3)> {
+    view.snap
         .iter()
         .flat_map(|s| s.players.iter())
         .filter(|p| p.team != me.team && p.alive())
-        .map(|p| (p.id, Vec3::from_array(p.pos)))
-        .collect();
-    if let Some(t) = nearest_enemy(&enemies, feet) {
+        .map(|p| (p.id, Vec3::from_array(p.pos) + Vec3::Y * 1.0))
+        .collect()
+}
+
+/// Starting a charge: lock the enemy under the crosshair, else the nearest one.
+fn lock_for_charge(
+    view: &View,
+    me: &crate::sim::PlayerView,
+    eye: Vec3,
+    forward: Vec3,
+    feet: Vec3,
+    lock: &mut LockOn,
+    actions: &mut LocalActions,
+) {
+    let enemies = enemy_chests(view, me);
+    if let Some(t) = charge_target(&enemies, eye, forward, feet + Vec3::Y * 1.0) {
         lock.0 = Some(t);
         actions.0.push(Action::Lock { target: Some(t) });
     }
@@ -867,6 +1159,64 @@ mod tests {
         assert_eq!(next_target(&e, None, from, fwd), Some(1));
         assert_eq!(next_target(&e, Some(1), from, fwd), Some(2));
         assert_eq!(next_target(&e, Some(3), from, fwd), Some(1), "wraps around");
+    }
+
+    #[test]
+    fn swinging_the_mouse_moves_the_lock() {
+        let e = [(1, Vec3::new(0.0, 0.0, -10.0)), (2, Vec3::new(6.0, 0.0, -10.0))];
+        let from = Vec3::ZERO;
+        // Still looking at 1: keep it.
+        assert_eq!(mouse_retarget(&e, Some(1), from, Vec3::NEG_Z), None);
+        // Looking at 2 now: switch.
+        let at2 = Vec3::new(6.0, 0.0, -10.0).normalize();
+        assert_eq!(mouse_retarget(&e, Some(1), from, at2), Some(2));
+        // Halfway between: not clearly closer, keep the lock (no flicker).
+        let mid = Vec3::new(3.0, 0.0, -10.0).normalize();
+        assert_eq!(mouse_retarget(&e, Some(1), from, mid), None);
+        // Way off to the side of everyone: nothing in the cone, keep it.
+        assert_eq!(mouse_retarget(&e, Some(1), from, Vec3::X), None);
+    }
+
+    #[test]
+    fn charge_locks_the_crosshair_target_first() {
+        let e = [(1, Vec3::new(0.0, 0.0, -30.0)), (2, Vec3::new(5.0, 0.0, 0.0))];
+        assert_eq!(charge_target(&e, Vec3::ZERO, Vec3::NEG_Z, Vec3::ZERO), Some(1), "under the crosshair");
+        assert_eq!(charge_target(&e, Vec3::ZERO, Vec3::Z, Vec3::ZERO), Some(2), "else the nearest");
+    }
+
+    #[test]
+    fn wall_moves_give_both_dashes_back() {
+        let mut d = LocalDash::default();
+        d.try_start(Vec3::X, false);
+        d.tick(DASH_SECS + DASH_GAP);
+        d.try_start(Vec3::X, false);
+        d.tick(DASH_SECS);
+        assert_eq!(d.charges, 0);
+        d.refill();
+        assert_eq!(d.charges, DASH_CHARGES);
+        assert!(d.try_start(Vec3::X, false), "ready at once");
+    }
+
+    #[test]
+    fn cover_throws_go_over_low_walls_and_round_tall_ones() {
+        let solids = layout::solids(ArenaId::Classic);
+        // Behind Red's low wall (z 6.6..7.4, 1.2 m), throwing at someone across it.
+        let feet = Vec3::new(0.0, 0.0, 7.95);
+        let c = Cover::find(feet, &solids).expect("cover");
+        let hold = feet + Vec3::Y * crate::sim::COVER_HOLD_HEIGHT + Vec3::NEG_Z * 0.45;
+        let target = Vec3::new(0.0, 0.3, 5.0);
+        let (aim, curve) = cover_throw(Some(&c), &solids, feet, hold, target);
+        assert_eq!(curve, 0.0);
+        assert!(aim.normalize().y > (target - hold).normalize().y, "tilted up over the wall");
+        // Out of cover: untouched.
+        assert_eq!(cover_throw(None, &solids, feet, hold, target), (target - hold, 0.0));
+        // Behind the 3 m pillar at (9, 0): curves around it.
+        let feet = Vec3::new(9.0, 0.0, 1.0 + BODY_RADIUS + 0.06);
+        let c = Cover::find(feet, &solids).expect("pillar cover");
+        assert!(!c.is_low(feet));
+        let hold = feet + Vec3::Y * HOLD_HEIGHT;
+        let (_, curve) = cover_throw(Some(&c), &solids, feet, hold, Vec3::new(9.0, 1.0, -10.0));
+        assert!(curve != 0.0);
     }
 
     #[test]

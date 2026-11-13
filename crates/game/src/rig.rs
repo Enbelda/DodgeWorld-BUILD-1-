@@ -4,22 +4,32 @@
 //! knee (kneecap) and ankle joints, calves and shoes. Every joint has a rounded joint
 //! capsule so the segments stay visibly connected as they bend.
 //!
+//! Clothes carry a woven fabric texture, skin a soft pore texture (both with normal maps);
+//! shirts have a collar, chest stripe and sleeve cuffs, shorts a belt, shoes white soles.
+//!
 //! Posed every frame from the player's state: walk/run cycle with a forward lean and
-//! breathing, gripping the held ball, winding up and swinging through a throw, open hands
-//! reaching out to catch, knocked flat, slimed spread-eagle, tucked flips, parkour (leaning
-//! off a wall while wall running, hand-over-hand climbing, hanging by both hands or one hand
-//! while throwing, pulling up over a ledge), and a white flash when hit.
+//! breathing, gripping the held ball, winding up (torso twisting back) and whipping through
+//! a throw with a step into it, open hands reaching out to catch and then cradling the ball
+//! into the chest as the impact shoves the body back, knocked flat, slimed spread-eagle,
+//! tucked flips, crouched behind cover, parkour (leaning off a wall while wall running,
+//! hand-over-hand climbing, hanging by both hands, or pulled up peeking over the ledge with
+//! the ball cocked behind the head, pulling up over a ledge), and a white flash when hit.
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use bevy::prelude::*;
 
-use crate::sim::{ParkourPose, PlayerId, PlayerView, Team, TrickKind, TrickState};
+use crate::sim::{GameEvent, ParkourPose, PlayerId, PlayerView, Team, TrickKind, TrickState};
+use crate::textures::Textures;
 
 /// Height of the hip/flip pivot above the feet. Flips rotate the body around it.
 const PIVOT: f32 = 0.9;
 /// Seconds the throw swing lasts.
-const THROW_SECS: f32 = 0.3;
+const THROW_SECS: f32 = 0.36;
+/// Seconds the catch impact + cradle lasts.
+pub const CATCH_ANIM_SECS: f32 = 0.55;
+/// How far the hips drop when crouched in cover.
+const CROUCH_DROP: f32 = 0.5;
 /// Seconds of white flash after a hit.
 const FLASH_SECS: f32 = 0.15;
 /// Running speed that counts as a full stride.
@@ -33,6 +43,10 @@ enum Part {
     Shoe,
     Hair,
     Visor,
+    /// Collar, chest stripe and cuffs.
+    Trim,
+    Sole,
+    Belt,
 }
 
 /// Joint order inside `Pose::joints` / `Rig::joints`.
@@ -70,6 +84,8 @@ struct Anim {
     speed: f32,
     was_holding: bool,
     throw_t: f32,
+    /// Seconds since this player last caught a ball.
+    catch_t: f32,
     last_hits: Option<u32>,
     flash: f32,
 }
@@ -86,6 +102,17 @@ pub struct Rig {
     anim: Anim,
 }
 
+impl Rig {
+    /// The wrist joint of hand 0 (left) / 1 (right): the held ball sits in its palm.
+    pub fn wrist(&self, hand: usize) -> Entity {
+        self.joints[L_WRIST + hand.min(1)]
+    }
+    /// Cradling a just-caught ball against the chest with both hands.
+    pub fn cradling(&self) -> bool {
+        self.anim.catch_t < CATCH_ANIM_SECS * 0.8
+    }
+}
+
 /// Extra local-only inputs: throw charge and the trick we are doing right now.
 #[derive(Resource, Default)]
 pub struct LocalRigInput {
@@ -93,6 +120,7 @@ pub struct LocalRigInput {
     pub trick: Option<TrickState>,
     pub dashing: bool,
     pub parkour: ParkourPose,
+    pub crouch: bool,
 }
 
 #[derive(Resource)]
@@ -107,6 +135,9 @@ pub struct RigAssets {
     shoe: Handle<StandardMaterial>,
     hair: Handle<StandardMaterial>,
     visor_mat: Handle<StandardMaterial>,
+    trim: [Handle<StandardMaterial>; 2],
+    sole: Handle<StandardMaterial>,
+    belt: Handle<StandardMaterial>,
     visor_catch: Handle<StandardMaterial>,
     slimed: Handle<StandardMaterial>,
     flash: Handle<StandardMaterial>,
@@ -116,6 +147,7 @@ pub struct RigAssets {
 
 pub fn make_rig_assets(
     mut commands: Commands,
+    textures: Res<Textures>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -125,20 +157,46 @@ pub fn make_rig_assets(
     let matte = |m: &mut Assets<StandardMaterial>, c: Color| {
         m.add(StandardMaterial { base_color: c, perceptual_roughness: 0.8, ..default() })
     };
-    // Unit shapes; every body part scales one of these.
+    // Woven cloth: the weave repeats a few times over each (unit-mapped) part.
+    let cloth = |m: &mut Assets<StandardMaterial>, c: Color, repeat: f32| {
+        m.add(StandardMaterial {
+            base_color: c,
+            base_color_texture: Some(textures.fabric.color.clone()),
+            normal_map_texture: Some(textures.fabric.normal.clone()),
+            perceptual_roughness: 0.85,
+            uv_transform: bevy::math::Affine2::from_scale(Vec2::splat(repeat)),
+            ..default()
+        })
+    };
+    // Unit shapes (with tangents for the normal maps); every body part scales one of these.
+    let tangents = |m: Mesh| m.clone().with_generated_tangents().unwrap_or(m);
     commands.insert_resource(RigAssets {
-        sphere: meshes.add(Sphere::new(0.5).mesh().uv(16, 10)),
-        capsule: meshes.add(Capsule3d::new(0.5, 1.0).mesh().rings(2).latitudes(8).longitudes(12)),
-        cylinder: meshes.add(Cylinder::new(0.5, 1.0).mesh().resolution(12)),
-        cube: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
-        shirt: [matte(&mut materials, Color::srgb(0.90, 0.25, 0.22)), matte(&mut materials, Color::srgb(0.22, 0.45, 0.95))],
-        pants: [matte(&mut materials, Color::srgb(0.45, 0.10, 0.10)), matte(&mut materials, Color::srgb(0.10, 0.20, 0.45))],
-        skin: matte(&mut materials, Color::srgb(0.93, 0.76, 0.60)),
-        shoe: matte(&mut materials, Color::srgb(0.12, 0.12, 0.14)),
+        sphere: meshes.add(tangents(Sphere::new(0.5).mesh().uv(24, 14))),
+        capsule: meshes.add(tangents(Capsule3d::new(0.5, 1.0).mesh().rings(4).latitudes(10).longitudes(16).build())),
+        cylinder: meshes.add(tangents(Cylinder::new(0.5, 1.0).mesh().resolution(16).build())),
+        cube: meshes.add(tangents(Mesh::from(Cuboid::new(1.0, 1.0, 1.0)))),
+        shirt: [cloth(&mut materials, Color::srgb(0.90, 0.25, 0.22), 3.0), cloth(&mut materials, Color::srgb(0.22, 0.45, 0.95), 3.0)],
+        pants: [cloth(&mut materials, Color::srgb(0.45, 0.10, 0.10), 3.0), cloth(&mut materials, Color::srgb(0.10, 0.20, 0.45), 3.0)],
+        skin: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.93, 0.76, 0.60),
+            base_color_texture: Some(textures.skin.color.clone()),
+            normal_map_texture: Some(textures.skin.normal.clone()),
+            perceptual_roughness: 0.6,
+            // A little subsurface-like softness: lighter in shadow.
+            diffuse_transmission: 0.15,
+            ..default()
+        }),
+        shoe: materials.add(StandardMaterial { base_color: Color::srgb(0.12, 0.12, 0.14), perceptual_roughness: 0.45, ..default() }),
         hair: matte(&mut materials, Color::srgb(0.20, 0.13, 0.08)),
+        trim: [cloth(&mut materials, Color::srgb(0.98, 0.92, 0.85), 2.0), cloth(&mut materials, Color::srgb(0.90, 0.95, 1.0), 2.0)],
+        sole: materials.add(StandardMaterial { base_color: Color::srgb(0.95, 0.95, 0.93), perceptual_roughness: 0.7, ..default() }),
+        belt: materials.add(StandardMaterial { base_color: Color::srgb(0.08, 0.07, 0.07), perceptual_roughness: 0.35, ..default() }),
         visor_mat: materials.add(StandardMaterial {
             base_color: Color::srgb(0.06, 0.06, 0.08),
-            perceptual_roughness: 0.2,
+            perceptual_roughness: 0.08,
+            clearcoat: 1.0,
+            clearcoat_perceptual_roughness: 0.05,
+            metallic: 0.3,
             ..default()
         }),
         visor_catch: glow(&mut materials, Color::srgb(1.0, 1.0, 0.6), LinearRgba::rgb(4.0, 4.0, 1.5)),
@@ -238,14 +296,24 @@ pub fn spawn_rig(commands: &mut Commands, a: &RigAssets, parent: Entity, offset:
     let mut joints = [Entity::PLACEHOLDER; JOINTS];
     let mut fingers = Vec::new();
 
-    // Pelvis (shorts).
+    // Pelvis (shorts) and belt with a buckle.
     b.shape(Shape::Capsule, Vec3::ZERO, Vec3::new(0.34, 0.11, 0.22), flip, Part::Pants);
+    b.shape(Shape::Cylinder, Vec3::new(0.0, 0.06, 0.0), Vec3::new(0.335, 0.045, 0.225), flip, Part::Belt);
+    b.shape(Shape::Cube, Vec3::new(0.0, 0.06, -0.112), Vec3::new(0.05, 0.035, 0.012), flip, Part::Sole);
 
     // Spine: abdomen, chest, and the trapezius band joining neck and shoulders.
     let spine = b.joint(Vec3::new(0.0, 0.06, 0.0), flip);
     joints[SPINE] = spine;
     b.shape(Shape::Capsule, Vec3::new(0.0, 0.1, 0.0), Vec3::new(0.30, 0.17, 0.21), spine, Part::Shirt);
     b.shape(Shape::Capsule, Vec3::new(0.0, 0.31, 0.0), Vec3::new(0.43, 0.21, 0.25), spine, Part::Shirt);
+    // Chest stripe (front and back) and a collar ring.
+    b.shape(Shape::Capsule, Vec3::new(0.0, 0.3, 0.0), Vec3::new(0.436, 0.035, 0.256), spine, Part::Trim);
+    b.part(
+        Shape::Cylinder,
+        Transform::from_xyz(0.0, 0.47, 0.0).with_scale(Vec3::new(0.15, 0.04, 0.15)),
+        spine,
+        Part::Trim,
+    );
     b.part(
         Shape::Capsule,
         Transform::from_xyz(0.0, 0.44, 0.01)
@@ -268,12 +336,19 @@ pub fn spawn_rig(commands: &mut Commands, a: &RigAssets, parent: Entity, offset:
     }
     b.shape(Shape::Sphere, head + Vec3::new(0.0, -0.025, -0.118), Vec3::new(0.035, 0.05, 0.04), neck, Part::Skin);
     b.shape(Shape::Cube, head + Vec3::new(0.0, 0.015, -0.105), Vec3::new(0.19, 0.045, 0.04), neck, Part::Visor);
+    // Eyebrows over the visor, and a chin.
+    for x in [-0.045_f32, 0.045] {
+        b.shape(Shape::Cube, head + Vec3::new(x, 0.052, -0.108), Vec3::new(0.06, 0.012, 0.02), neck, Part::Hair);
+    }
+    b.shape(Shape::Sphere, head + Vec3::new(0.0, -0.105, -0.085), Vec3::new(0.06, 0.04, 0.04), neck, Part::Skin);
 
     // Arms: deltoid, sleeve, upper arm with biceps, elbow, forearm, wrist, hand.
     for (side, x) in [(0usize, -0.235_f32), (1, 0.235)] {
         let shoulder = b.joint(Vec3::new(x, 0.42, 0.0), spine);
         b.ball(Vec3::ZERO, 0.075, shoulder, Part::Shirt);
         b.shape(Shape::Cylinder, Vec3::new(0.0, -0.06, 0.0), Vec3::new(0.13, 0.12, 0.13), shoulder, Part::Shirt);
+        // Sleeve cuff.
+        b.shape(Shape::Cylinder, Vec3::new(0.0, -0.125, 0.0), Vec3::new(0.134, 0.025, 0.134), shoulder, Part::Trim);
         b.bone(0.28, 0.052, shoulder, Part::Skin);
         b.shape(Shape::Sphere, Vec3::new(0.0, -0.15, -0.018), Vec3::new(0.085, 0.15, 0.08), shoulder, Part::Skin);
         let elbow = b.joint(Vec3::new(0.0, -0.28, 0.0), shoulder);
@@ -281,6 +356,8 @@ pub fn spawn_rig(commands: &mut Commands, a: &RigAssets, parent: Entity, offset:
         b.bone(0.25, 0.043, elbow, Part::Skin);
         b.shape(Shape::Sphere, Vec3::new(0.0, -0.07, 0.0), Vec3::new(0.095, 0.15, 0.09), elbow, Part::Skin);
         let wrist = b.joint(Vec3::new(0.0, -0.25, 0.0), elbow);
+        // Sweatband on the wrist.
+        b.shape(Shape::Cylinder, Vec3::new(0.0, 0.03, 0.0), Vec3::new(0.1, 0.05, 0.1), wrist, Part::Trim);
         build_hand(&mut b, wrist, side, &mut fingers);
         joints[side * 2] = shoulder;
         joints[side * 2 + 1] = elbow;
@@ -301,6 +378,10 @@ pub fn spawn_rig(commands: &mut Commands, a: &RigAssets, parent: Entity, offset:
         b.ball(Vec3::ZERO, 0.046, ankle, Part::Skin);
         b.shape(Shape::Cube, Vec3::new(0.0, -0.045, -0.05), Vec3::new(0.11, 0.07, 0.24), ankle, Part::Shoe);
         b.shape(Shape::Sphere, Vec3::new(0.0, -0.05, -0.16), Vec3::new(0.11, 0.07, 0.08), ankle, Part::Shoe);
+        // Sole, toe cap and a sock cuff.
+        b.shape(Shape::Cube, Vec3::new(0.0, -0.085, -0.06), Vec3::new(0.118, 0.025, 0.29), ankle, Part::Sole);
+        b.shape(Shape::Sphere, Vec3::new(0.0, -0.06, -0.175), Vec3::new(0.105, 0.05, 0.07), ankle, Part::Sole);
+        b.shape(Shape::Cylinder, Vec3::new(0.0, 0.04, 0.0), Vec3::new(0.105, 0.06, 0.105), ankle, Part::Trim);
         joints[4 + side * 2] = hip;
         joints[4 + side * 2 + 1] = knee;
         joints[L_ANKLE + side] = ankle;
@@ -328,6 +409,10 @@ pub struct PoseInput {
     /// Seconds since start, for breathing.
     pub time: f32,
     pub parkour: ParkourPose,
+    /// Seconds since the last catch (>= CATCH_ANIM_SECS means done).
+    pub catch_t: f32,
+    /// Crouched behind cover.
+    pub crouch: bool,
 }
 
 /// Joint angles: (pitch about X, roll about Z). Positive shoulder pitch raises the arm forward;
@@ -342,6 +427,11 @@ pub struct Pose {
     pub drop: f32,
     /// Sideways lean of the whole body about Z (wall running).
     pub body_roll: f32,
+    /// Torso twist about Y at the spine (winding up / following through a throw).
+    pub twist: f32,
+    /// How far the hips move forward (-Z) of the feet: stepping into a throw, or shoved
+    /// back by a catch (negative).
+    pub lunge: f32,
     /// How closed each hand is: 0 open and spread, 1 a fist. [left, right].
     pub grip: [f32; 2],
 }
@@ -371,14 +461,27 @@ pub fn pose(i: &PoseInput) -> Pose {
     j[SPINE] = (-0.18 * i.stride + 0.02 * breathe, 0.0);
     j[NECK] = (0.15 * i.stride - 0.015 * breathe, 0.0);
 
-    // Right arm: grip the ball out front, cock it back while charging, swing through on release.
+    // Right arm: grip the ball out front, cock it back while charging, whip through on release
+    // with the torso unwinding, the free arm pulling back and a step into the throw.
     if i.throw_t < THROW_SECS {
         let t = i.throw_t / THROW_SECS;
-        j[R_SHOULDER] = (lerp(-2.5, 1.6, t), 0.1);
-        j[R_ELBOW] = (lerp(1.2, 0.1, t), 0.0);
-        j[R_WRIST] = (lerp(-0.6, 0.5, t), 0.0);
-        j[L_SHOULDER] = (0.8, -0.2);
-        j[SPINE] = (lerp(0.2, -0.35, t), 0.0);
+        let e = 1.0 - (1.0 - t).powi(3); // fast whip, then settle
+        let s = (t * PI).sin();
+        j[R_SHOULDER] = (lerp(-2.6, 1.8, e), lerp(0.25, -0.2, e));
+        j[R_ELBOW] = (lerp(1.3, 0.05, e), 0.0);
+        j[R_WRIST] = (lerp(-0.7, 0.8, e), 0.0);
+        j[L_SHOULDER] = (lerp(1.3, -0.6, e), -0.25);
+        j[L_ELBOW] = (lerp(0.4, 1.2, e), 0.0);
+        j[SPINE] = (lerp(0.25, -0.5, e), 0.0);
+        j[NECK] = (lerp(0.0, 0.25, e), 0.0);
+        p.twist = lerp(-0.55, 0.6, e);
+        j[L_HIP] = (0.55 * s, -0.05);
+        j[L_KNEE] = (-0.35 * s, 0.0);
+        j[R_HIP] = (-0.5 * s, 0.05);
+        j[R_KNEE] = (-0.6 * s, 0.0);
+        j[R_ANKLE] = (-0.5 * s, 0.0);
+        p.lunge = 0.2 * s;
+        p.drop = 0.08 * s;
         p.grip[1] = 0.1; // fingers open as the ball leaves
     } else if i.holding {
         p.grip[1] = 0.9;
@@ -389,6 +492,7 @@ pub fn pose(i: &PoseInput) -> Pose {
                 j[R_WRIST] = (lerp(0.0, -0.6, c), 0.0);
                 j[L_SHOULDER] = (lerp(0.2, 1.2, c), -0.15);
                 j[SPINE] = (lerp(j[SPINE].0, 0.2, c), 0.0);
+                p.twist = -0.55 * c; // torso coils back
                 p.grip[0] = lerp(0.35, 0.1, c); // leading hand opens toward the target
             }
             None => {
@@ -408,6 +512,59 @@ pub fn pose(i: &PoseInput) -> Pose {
         j[R_WRIST] = (0.3, 0.0);
         j[SPINE] = (-0.1, 0.0);
         p.grip = [0.05, 0.05];
+    }
+
+    // Just caught: the impact shoves the body back and both arms wrap the ball into the
+    // chest, hunched over it; then it eases back into the normal holding pose.
+    if i.catch_t < CATCH_ANIM_SECS {
+        let k = i.catch_t / CATCH_ANIM_SECS;
+        let impact = (1.0 - k).powi(2);
+        let w = if k < 0.7 { 1.0 } else { (1.0 - k) / 0.3 };
+        let cradle = [
+            (L_SHOULDER, (0.75, 0.45)),
+            (R_SHOULDER, (0.75, -0.45)),
+            (L_ELBOW, (1.9, 0.0)),
+            (R_ELBOW, (1.9, 0.0)),
+            (L_WRIST, (0.4, 0.0)),
+            (R_WRIST, (0.4, 0.0)),
+            (SPINE, (-0.35 + 0.1 * impact, 0.0)),
+            (NECK, (-0.25, 0.0)),
+            (L_HIP, (0.45 * impact, -0.05)),
+            (R_HIP, (-0.35 * impact, 0.05)),
+            (L_KNEE, (-0.7 * impact, 0.0)),
+            (R_KNEE, (-0.5 * impact, 0.0)),
+        ];
+        for (jj, (pitch, roll)) in cradle {
+            j[jj] = (lerp(j[jj].0, pitch, w), lerp(j[jj].1, roll, w));
+        }
+        p.grip = [lerp(p.grip[0], 0.75, w), lerp(p.grip[1], 0.75, w)];
+        p.body_pitch += 0.25 * impact;
+        p.lunge -= 0.25 * impact;
+        p.drop += 0.12 * impact;
+        p.twist *= 1.0 - w;
+    }
+
+    // Crouched behind cover: deep knee bend, leaning in, free hand on the wall. Aiming or
+    // just thrown stands you up again (the caller clears `crouch`).
+    if i.crouch {
+        let shuffle = swing * 0.3;
+        j[L_HIP] = (1.4 + shuffle, -0.1);
+        j[R_HIP] = (1.4 - shuffle, 0.1);
+        j[L_KNEE] = (-2.2, 0.0);
+        j[R_KNEE] = (-2.2, 0.0);
+        j[L_ANKLE] = (0.75, 0.0);
+        j[R_ANKLE] = (0.75, 0.0);
+        j[SPINE] = (-0.45, 0.0);
+        j[NECK] = (0.35, 0.0);
+        j[L_SHOULDER] = (1.3, -0.1);
+        j[L_ELBOW] = (0.5, 0.0);
+        j[L_WRIST] = (-0.6, 0.0);
+        p.grip[0] = 0.1;
+        if !i.holding {
+            j[R_SHOULDER] = (0.6, 0.15);
+            j[R_ELBOW] = (1.0, 0.0);
+        }
+        p.drop = p.drop.max(CROUCH_DROP);
     }
 
     // Slimed to a wall: spread-eagle, fingers splayed.
@@ -455,6 +612,30 @@ pub fn pose(i: &PoseInput) -> Pose {
             j[R_KNEE] = (-1.3, 0.0);
             j[SPINE] = (-0.1, 0.0);
             p.grip[0] = 0.7;
+        }
+        ParkourPose::Hang if i.holding => {
+            // Pulled up with one hand flat on the ledge, head up looking over it, the ball
+            // cocked back behind the head ready to throw (charging winds it further).
+            j[L_SHOULDER] = (1.75, -0.15);
+            j[L_ELBOW] = (0.6, 0.0);
+            j[L_WRIST] = (-0.8, 0.0);
+            p.grip[0] = 0.4;
+            if i.charge.is_none() && i.throw_t >= THROW_SECS {
+                j[R_SHOULDER] = (-2.6, 0.3);
+                j[R_ELBOW] = (1.4, 0.0);
+                j[R_WRIST] = (-0.6, 0.0);
+                p.grip[1] = 0.9;
+            }
+            j[L_HIP] = (0.3, -0.05);
+            j[R_HIP] = (0.15, 0.05);
+            j[L_KNEE] = (-0.6, 0.0);
+            j[R_KNEE] = (-0.3, 0.0);
+            j[L_ANKLE] = (-0.4, 0.0);
+            j[R_ANKLE] = (-0.4, 0.0);
+            j[SPINE] = (-0.05, 0.0);
+            j[NECK] = (0.1, 0.0);
+            p.twist = 0.0;
+            p.lunge = 0.0;
         }
         ParkourPose::Hang => {
             // Arms straight up gripping the ledge; legs dangling a little forward.
@@ -575,6 +756,14 @@ pub fn animate_rigs(
 ) {
     let dt = time.delta_secs().max(1e-4);
     let Some(snap) = view.snap.as_ref() else { return };
+    let catchers: Vec<PlayerId> = view
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            GameEvent::Caught { catcher, .. } => Some(*catcher),
+            _ => None,
+        })
+        .collect();
     for (mut rig, gt) in &mut rigs {
         let pv: Option<&PlayerView> = match rig.player {
             Some(id) => snap.players.iter().find(|p| p.id == id),
@@ -600,6 +789,15 @@ pub fn animate_rigs(
             a.throw_t += dt;
         }
         a.was_holding = pv.holding;
+        if catchers.contains(&pv.id) {
+            a.catch_t = 0.0;
+            a.throw_t = THROW_SECS; // a catch interrupts any throw follow-through
+        } else {
+            a.catch_t = (a.catch_t + dt).min(10.0);
+        }
+        if a.last_pos.is_none() || !pv.alive() {
+            a.catch_t = 10.0;
+        }
         if a.last_hits.is_some_and(|h| h != pv.hits) {
             a.flash = FLASH_SECS;
         }
@@ -619,16 +817,19 @@ pub fn animate_rigs(
             parkour: if is_local { local.parkour } else { pv.parkour },
             // Offset per player so a team doesn't breathe in sync.
             time: time.elapsed_secs() + pv.id as f32 * 0.7,
+            catch_t: a.catch_t,
+            crouch: if is_local { local.crouch } else { pv.cover == crate::sim::CoverPose::Crouched },
         };
         let p = pose(&input);
 
         if let Ok(mut tf) = transforms.get_mut(r.flip) {
-            tf.translation.y = PIVOT - p.drop;
+            tf.translation = Vec3::new(0.0, PIVOT - p.drop, -p.lunge);
             tf.rotation = Quat::from_rotation_z(p.body_roll) * Quat::from_rotation_x(p.body_pitch);
         }
         for (k, &(pitch, roll)) in p.joints.iter().enumerate() {
             if let Ok(mut tf) = transforms.get_mut(r.joints[k]) {
-                tf.rotation = Quat::from_rotation_z(roll) * Quat::from_rotation_x(pitch);
+                let twist = if k == SPINE { Quat::from_rotation_y(p.twist) } else { Quat::IDENTITY };
+                tf.rotation = twist * Quat::from_rotation_z(roll) * Quat::from_rotation_x(pitch);
             }
         }
         for &(e, hand, bone) in &r.fingers {
@@ -660,6 +861,10 @@ pub fn animate_rigs(
                     Part::Skin => &assets.skin,
                     Part::Shoe => &assets.shoe,
                     Part::Hair => &assets.hair,
+                    Part::Trim | Part::Belt if slimed => &assets.slimed,
+                    Part::Trim => &assets.trim[team],
+                    Part::Sole => &assets.sole,
+                    Part::Belt => &assets.belt,
                 }
             };
             if m.0 != *want {
@@ -674,7 +879,7 @@ mod tests {
     use super::*;
 
     fn idle() -> PoseInput {
-        PoseInput { throw_t: 10.0, ..default() }
+        PoseInput { throw_t: 10.0, catch_t: 10.0, ..default() }
     }
 
     #[test]
@@ -757,8 +962,51 @@ mod tests {
         assert!(hang.joints[L_SHOULDER].0 > 2.8 && hang.joints[R_SHOULDER].0 > 2.8, "both hands on the ledge");
         assert!(hang.grip[0] > 0.8 && hang.grip[1] > 0.8);
         let aiming = pose(&PoseInput { parkour: ParkourPose::Hang, holding: true, charge: Some(1.0), ..idle() });
-        assert!(aiming.joints[L_SHOULDER].0 > 2.8, "left hand still holds on");
+        assert!(aiming.joints[L_SHOULDER].0 > 1.5, "left hand still on the ledge");
         assert!(aiming.joints[R_SHOULDER].0 < -2.0, "right arm winds up the throw");
+    }
+
+    #[test]
+    fn hanging_with_a_ball_peeks_over_with_it_cocked_behind_the_head() {
+        let p = pose(&PoseInput { parkour: ParkourPose::Hang, holding: true, ..idle() });
+        assert!(p.joints[R_SHOULDER].0 < -2.3 && p.joints[R_ELBOW].0 > 1.2, "ball cocked back behind the head");
+        assert!(p.joints[L_SHOULDER].0 > 1.5 && p.joints[L_SHOULDER].0 < 2.2, "one hand on the ledge");
+        assert!(p.joints[NECK].0 >= 0.0, "head up, looking over");
+    }
+
+    #[test]
+    fn throw_twists_through_and_steps_into_it() {
+        let wind = pose(&PoseInput { holding: true, charge: Some(1.0), ..idle() });
+        assert!(wind.twist < -0.4, "coiled back");
+        let mid = pose(&PoseInput { throw_t: THROW_SECS * 0.5, ..idle() });
+        assert!(mid.lunge > 0.15, "hips drive forward");
+        assert!(mid.joints[L_HIP].0 > 0.4, "lead leg steps out");
+        let end = pose(&PoseInput { throw_t: THROW_SECS * 0.99, ..idle() });
+        assert!(end.twist > 0.5, "unwound past square");
+        assert!(end.joints[L_SHOULDER].0 < 0.0, "free arm pulled back");
+    }
+
+    #[test]
+    fn catch_cradles_the_ball_and_is_shoved_back() {
+        let hit = pose(&PoseInput { holding: true, catch_t: 0.0, ..idle() });
+        assert!(hit.lunge < -0.2, "pushed back");
+        assert!(hit.body_pitch > 0.2, "rocked back by the impact");
+        assert!(hit.joints[L_ELBOW].0 > 1.5 && hit.joints[R_ELBOW].0 > 1.5, "arms wrapped in");
+        assert!(hit.joints[L_SHOULDER].1 > 0.3 && hit.joints[R_SHOULDER].1 < -0.3, "hands together at the chest");
+        assert!(hit.grip[0] > 0.6 && hit.grip[1] > 0.6);
+        let later = pose(&PoseInput { holding: true, catch_t: CATCH_ANIM_SECS * 0.9, ..idle() });
+        assert!(later.lunge.abs() < 0.05, "recovered");
+        let done = pose(&PoseInput { holding: true, catch_t: CATCH_ANIM_SECS, ..idle() });
+        assert_eq!(done, pose(&PoseInput { holding: true, ..idle() }));
+    }
+
+    #[test]
+    fn crouching_bends_the_knees_and_lowers_the_hips() {
+        let c = pose(&PoseInput { crouch: true, ..idle() });
+        assert!(c.joints[L_KNEE].0 < -2.0 && c.joints[R_KNEE].0 < -2.0);
+        assert!(c.drop >= CROUCH_DROP);
+        // Hips at about CROUCH_HEIGHT - head room: under a 1.2 m wall the head stays below 1.2.
+        assert!(PIVOT - c.drop < 0.5);
     }
 
     #[test]

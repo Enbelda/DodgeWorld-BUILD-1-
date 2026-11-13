@@ -4,7 +4,7 @@
 
 use bevy::math::Vec3;
 
-use super::layout::{Aabb, ARENA_HALF};
+use super::layout::Aabb;
 use super::{Action, BallState, Match, PlayerId, Team, BODY_RADIUS};
 
 pub const BOT_SPEED: f32 = 5.5;
@@ -140,8 +140,9 @@ pub fn think(m: &mut Match, id: PlayerId, dt: f32) -> Vec<Action> {
             let reached = brain.wander.is_none_or(|w| w.distance(me.pos) < 1.0);
             if reached {
                 let side = if me.team == Team::Red { 1.0 } else { -1.0 };
-                let x = (m.rng.f32() - 0.5) * 2.0 * (ARENA_HALF - 3.0);
-                let z = side * (3.0 + m.rng.f32() * (ARENA_HALF - 6.0));
+                let half = m.half();
+                let x = (m.rng.f32() - 0.5) * 2.0 * (half - 3.0);
+                let z = side * (3.0 + m.rng.f32() * (half - 6.0));
                 brain.wander = Some(Vec3::new(x, 0.0, z));
             }
             brain.wander
@@ -158,13 +159,13 @@ pub fn think(m: &mut Match, id: PlayerId, dt: f32) -> Vec<Action> {
         let d = Vec3::new(g.x - pos.x, 0.0, g.z - pos.z);
         if d.length() > 0.2 {
             let want = (BOT_SPEED * dt).min(d.length());
-            let (next, side) = steer(pos, d.normalize() * want, brain.detour, &m.solids);
+            let (next, side) = steer(pos, d.normalize() * want, brain.detour, &m.solids, m.half());
             brain.detour = side;
             pos = next;
             face.get_or_insert(d);
         }
     }
-    pos = collide_feet(pos, &m.solids);
+    pos = collide_feet(pos, &m.solids, m.half());
     pos.y = 0.0;
     if let Some(f) = face {
         if f.x != 0.0 || f.z != 0.0 {
@@ -181,14 +182,14 @@ pub fn think(m: &mut Match, id: PlayerId, dt: f32) -> Vec<Action> {
 
 /// Move by `step`, going around cover: try straight, then angled, then sideways,
 /// preferring the side we used last time. Returns the new position and the side used.
-pub fn steer(pos: Vec3, step: Vec3, side: f32, solids: &[Aabb]) -> (Vec3, f32) {
+pub fn steer(pos: Vec3, step: Vec3, side: f32, solids: &[Aabb], half: f32) -> (Vec3, f32) {
     let side = if side == 0.0 { 1.0 } else { side };
     let want = step.length();
-    let mut best = (collide_feet(pos + step, solids), side);
+    let mut best = (collide_feet(pos + step, solids, half), side);
     for s in [side, -side] {
         for angle in [0.0_f32, 0.8, 1.57, 2.2] {
             let dir = bevy::math::Quat::from_rotation_y(angle * s) * step;
-            let next = collide_feet(pos + dir, solids);
+            let next = collide_feet(pos + dir, solids, half);
             let progress = Vec3::new(next.x - pos.x, 0.0, next.z - pos.z).length();
             let need = if angle == 0.0 { 0.9 } else { 0.5 };
             if progress >= want * need {
@@ -203,7 +204,7 @@ pub fn steer(pos: Vec3, step: Vec3, side: f32, solids: &[Aabb]) -> (Vec3, f32) {
 }
 
 /// Keep a bot's feet out of solids and inside the arena (2D, ignores box height above head).
-pub fn collide_feet(mut pos: Vec3, solids: &[Aabb]) -> Vec3 {
+pub fn collide_feet(mut pos: Vec3, solids: &[Aabb], half: f32) -> Vec3 {
     for s in solids {
         let e = s.expanded(BODY_RADIUS);
         if pos.x > e.min.x && pos.x < e.max.x && pos.z > e.min.z && pos.z < e.max.z {
@@ -217,7 +218,7 @@ pub fn collide_feet(mut pos: Vec3, solids: &[Aabb]) -> Vec3 {
             }
         }
     }
-    let lim = ARENA_HALF - BODY_RADIUS;
+    let lim = half - BODY_RADIUS;
     pos.x = pos.x.clamp(-lim, lim);
     pos.z = pos.z.clamp(-lim, lim);
     pos
@@ -246,8 +247,8 @@ mod tests {
         for _ in 0..400 {
             let goal = Vec3::new(0.0, 0.0, -5.0);
             let d = (goal - pos).normalize() * 0.1;
-            (pos, side) = steer(pos, d, side, &[wall]);
-            pos = collide_feet(pos, &[wall]);
+            (pos, side) = steer(pos, d, side, &[wall], super::super::layout::ARENA_HALF);
+            pos = collide_feet(pos, &[wall], super::super::layout::ARENA_HALF);
         }
         assert!(pos.z < -2.0, "got around the wall: {pos}");
     }
@@ -255,7 +256,7 @@ mod tests {
     #[test]
     fn feet_pushed_out_of_cover() {
         let b = Aabb::from_center(Vec3::new(0.0, 1.0, 0.0), Vec3::ONE);
-        let p = collide_feet(Vec3::new(0.9, 0.0, 0.1), &[b]);
+        let p = collide_feet(Vec3::new(0.9, 0.0, 0.1), &[b], super::super::layout::ARENA_HALF);
         assert!(p.x >= 1.0 + BODY_RADIUS - 1e-5);
     }
 

@@ -15,7 +15,8 @@ usage: brawl_game [options]
   --deathmatch       start in deathmatch mode (no respawns)
   --night            start on the night arena
   --autopilot        bot-driven local player, for automated play-tests
-  --drill            autopilot runs a parkour drill (wall runs, climbs, hangs)";
+  --drill            autopilot runs a parkour drill (wall runs, climbs, hangs)
+  --grand            host on the grand arena (twice the size)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -36,11 +37,13 @@ pub struct LaunchConfig {
     pub night: bool,
     /// Autopilot runs the parkour drill instead of playing.
     pub drill: bool,
+    /// Host on the grand arena.
+    pub grand: bool,
 }
 
 impl Default for LaunchConfig {
     fn default() -> Self {
-        LaunchConfig { mode: Mode::Host { lan: true }, name: "Player".into(), port: DEFAULT_PORT, bots: 1, bind: None, autopilot: false, deathmatch: false, night: false, drill: false }
+        LaunchConfig { mode: Mode::Host { lan: true }, name: "Player".into(), port: DEFAULT_PORT, bots: 1, bind: None, autopilot: false, deathmatch: false, night: false, drill: false, grand: false }
     }
 }
 
@@ -69,6 +72,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchConfig, St
             "--autopilot" => cfg.autopilot = true,
             "--deathmatch" => cfg.deathmatch = true,
             "--night" => cfg.night = true,
+            "--grand" => cfg.grand = true,
             "--drill" => {
                 cfg.drill = true;
                 cfg.autopilot = true;
@@ -125,6 +129,7 @@ mod tests {
         assert!(c.deathmatch && c.night);
         let d = p("--drill").unwrap();
         assert!(d.drill && d.autopilot, "the drill runs on the autopilot");
+        assert!(p("--grand").unwrap().grand);
     }
 
     #[test]

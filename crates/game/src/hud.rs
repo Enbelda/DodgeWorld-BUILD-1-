@@ -9,7 +9,7 @@ use crate::player::{Charge, LocalDash, LockOn, MoveIntent, DASH_CHARGES, DASH_RE
 use crate::session::{SessionSet, View};
 use crate::sim::ball::BallKind;
 use crate::sim::{
-    BallState, GameMode, MapId, ParkourPose, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
+    BallState, CoverPose, GameMode, MapId, ParkourPose, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
     PERFECT_SECS,
 };
 
@@ -86,8 +86,9 @@ impl Plugin for HudPlugin {
 }
 
 const CONTROLS: &str = "WASD move   Shift sprint   Ctrl dash/tackle   Space jump (x2 in air)\n\
-Hold LMB: charge (locks nearest), release: throw   Q/E: curve   F: lob\n\
-RMB: catch - time it! red ring = PERFECT   Tab/MMB while charging: switch target\n\
+Hold LMB: charge (locks the enemy under the crosshair), release: throw   Q/E: curve   F while charging: lob\n\
+RMB: catch - time it! red ring = PERFECT   While charging: swing the mouse (or Tab/MMB) to switch target\n\
+F by a wall: take cover (A/D slide, charge to rise and throw over it; F / sprint to leave)\n\
 In the air: Q/E spin 180   W+Q/E front flip   S+Q/E back flip   Esc: free mouse\n\
 Parkour: jump along a tall wall = wall run (Space: wall jump)   jump into it = climb   grab ledges";
 
@@ -324,10 +325,11 @@ fn update_hud(
                         GameMode::Standard => "Standard (respawns, first to 10)",
                         GameMode::Deathmatch => "Deathmatch (no respawns)",
                     };
-                    let map = match s.map {
-                        MapId::Day => "Day arena",
-                        MapId::Night => "Night arena",
+                    let look = match s.map {
+                        MapId::Day => "day",
+                        MapId::Night => "night",
                     };
+                    let map = format!("{} ({look})", s.arena.name());
                     lines.push(format!("Mode: {mode}   Map: {map}"));
                     let host_keys = match s.phase {
                         Phase::Lobby => "Enter: start   B/N: add/remove bot   M: mode   V: map",
@@ -476,6 +478,11 @@ fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
         ParkourPose::WallRunLeft | ParkourPose::WallRunRight => lines.push("WALL RUN! Space: wall jump".to_string()),
         ParkourPose::Climb => lines.push("CLIMBING".to_string()),
         ParkourPose::Mantle | ParkourPose::None => {}
+    }
+    match me.cover {
+        CoverPose::Crouched => lines.push("IN COVER: A/D slide   hold LMB to rise and throw   F / Shift: leave".to_string()),
+        CoverPose::Up => lines.push("IN COVER: risen up - release to throw over".to_string()),
+        CoverPose::None => {}
     }
     if me.slimed > 0.0 {
         lines.push(format!("SLIMED! stuck and helpless {:.1}s", me.slimed));

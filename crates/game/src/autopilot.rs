@@ -3,6 +3,9 @@
 //! It cycles through straight, curved and lobbed throws, goes for perfect catches, sprints,
 //! dashes now and then, and every few seconds does a double-jump flip or an air spin.
 //!
+//! Every few throws it takes cover instead: walks behind a low wall between it and the
+//! enemy, presses F, stays crouched a moment, rises, throws over the wall and leaves.
+//!
 //! With `--drill` it instead loops a parkour drill on the +X flank: wall run along the outer
 //! wall, wall jump across to the panel and wall run on it, then climb the panel, hang from
 //! its ledge (throwing from there if holding a ball), shimmy, climb up on top and drop off.
@@ -11,7 +14,8 @@ use bevy::prelude::*;
 
 use crate::camera::FollowCamera;
 use crate::parkour;
-use crate::player::{Autopilot, LocalBody, LocalParkour, LockOn, MoveIntent, Side, FEET_OFFSET};
+use crate::cover::Cover;
+use crate::player::{Autopilot, LocalArena, LocalBody, LocalCover, LocalParkour, LockOn, MoveIntent, Side, FEET_OFFSET};
 use crate::session::{LocalActions, View};
 use crate::sim::{bot::yaw_toward, Action, BallState, HOLD_HEIGHT};
 
@@ -47,6 +51,11 @@ pub struct AutoState {
     trick_step: u32,
     tricks: u32,
     dash_timer: f32,
+    /// Cover routine: active, which step, seconds in it, and how many done.
+    cover_on: bool,
+    cover_step: u32,
+    cover_t: f32,
+    covers: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -63,6 +72,8 @@ pub fn drive(
     drill_on: Res<ParkourDrill>,
     pk: Res<LocalParkour>,
     mut ds: Local<DrillState>,
+    arena: Res<LocalArena>,
+    mut cover: ResMut<LocalCover>,
 ) {
     if !auto.0 {
         return;
@@ -128,6 +139,23 @@ pub fn drive(
         }
         p
     });
+
+    // Every fourth throw is taken from cover.
+    if me.holding && (incoming.is_none() || cover.cover.is_some()) && (st.cover_on || st.throws % 4 == 3) {
+        if let Some(e) = enemy {
+            st.cover_on = true;
+            if cover_routine(&mut st, dt, feet, e, &arena.solids, &mut cover, &mut cam, &mut intent, &mut actions) {
+                return;
+            }
+        }
+    }
+    if !me.holding && st.cover_on {
+        st.cover_on = false;
+        st.cover_step = 0;
+        if cover.cover.is_some() {
+            intent.cover = true; // lost the ball somehow: leave cover
+        }
+    }
 
     let goal = if me.holding {
         enemy.map(|e| {
@@ -383,4 +411,118 @@ fn drill(
             }
         }
     }
+}
+
+/// A spot behind a low wall (seen from `enemy`) near `feet`: the open face pointing away
+/// from the enemy, 0.7 m off it.
+pub fn cover_spot(feet: Vec3, enemy: Vec3, solids: &[crate::sim::layout::Aabb]) -> Option<Vec3> {
+    solids
+        .iter()
+        .skip(4)
+        .filter(|b| (1.0..=2.6).contains(&b.max.y))
+        .map(|b| {
+            let c = b.center();
+            let away = Vec3::new(c.x - enemy.x, 0.0, c.z - enemy.z);
+            // The face on the far side from the enemy, along the box's thin axis.
+            let n = if b.half().x < b.half().z { Vec3::X * away.x.signum() } else { Vec3::Z * away.z.signum() };
+            let along = Vec3::Y.cross(n).abs();
+            let face = c + n * (if n.x != 0.0 { b.half().x } else { b.half().z });
+            // Stand opposite where we are along the wall (clamped to it), 0.7 m out.
+            let span = if n.x != 0.0 { b.half().z } else { b.half().x };
+            let off = (feet - c).dot(along).clamp(-span + 0.4, span - 0.4);
+            let spot = Vec3::new(face.x, 0.0, face.z) + along * off + n * 0.7;
+            (spot.distance(feet), spot)
+        })
+        .filter(|(d, _)| *d < 14.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, p)| p)
+}
+
+/// One frame of the cover routine. Returns true while it is driving the player.
+#[allow(clippy::too_many_arguments)]
+fn cover_routine(
+    st: &mut AutoState,
+    dt: f32,
+    feet: Vec3,
+    enemy: Vec3,
+    solids: &[crate::sim::layout::Aabb],
+    cover: &mut LocalCover,
+    cam: &mut FollowCamera,
+    intent: &mut MoveIntent,
+    actions: &mut LocalActions,
+) -> bool {
+    st.cover_t += dt;
+    let done = |st: &mut AutoState| {
+        st.cover_on = false;
+        st.cover_step = 0;
+        st.cover_t = 0.0;
+        st.throws += 1;
+    };
+    match st.cover_step {
+        // Walk behind the nearest low wall.
+        0 => {
+            let Some(spot) = cover_spot(feet, enemy, solids) else {
+                info!("autopilot: no cover nearby");
+                done(st);
+                return false;
+            };
+            let d = Vec3::new(spot.x - feet.x, 0.0, spot.z - feet.z);
+            if d.length() > 0.35 {
+                intent.dir = d.normalize();
+                intent.sprint = d.length() > 4.0;
+                cam.yaw = yaw_toward(d);
+            } else if Cover::find(feet, solids).is_some() {
+                intent.cover = true;
+                st.cover_step = 1;
+                st.cover_t = 0.0;
+            }
+            if st.cover_t > 8.0 {
+                info!("autopilot: could not reach cover");
+                done(st);
+            }
+        }
+        // Crouched behind it, looking toward the enemy.
+        1 => {
+            cam.yaw = yaw_toward(Vec3::new(enemy.x - feet.x, 0.0, enemy.z - feet.z));
+            if cover.cover.is_none() {
+                info!("autopilot: cover failed to start");
+                done(st);
+            } else if st.cover_t > 1.0 {
+                info!("autopilot: crouched in cover ({})", if cover.crouched { "hidden" } else { "NOT crouched" });
+                st.cover_step = 2;
+                st.cover_t = 0.0;
+            }
+        }
+        // Rise and pre-charge, then throw over the wall.
+        2 => {
+            cam.yaw = yaw_toward(Vec3::new(enemy.x - feet.x, 0.0, enemy.z - feet.z));
+            intent.aiming = true;
+            intent.face_camera = true;
+            if st.cover_t > 0.6 {
+                let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+                let hold = feet + Vec3::Y * crate::sim::COVER_HOLD_HEIGHT + forward * 0.45;
+                let target = enemy + Vec3::Y * 1.0;
+                let (aim, curve) = crate::player::cover_throw(cover.cover.as_ref(), solids, feet, hold, target);
+                actions.0.push(Action::Throw { aim: aim.normalize_or(forward).to_array(), charge: 1.0, curve, lob: false });
+                if let Some(c) = cover.cover.as_mut() {
+                    c.popped_up();
+                }
+                st.covers += 1;
+                info!("autopilot: threw from cover #{} (curve {curve})", st.covers);
+                st.cover_step = 3;
+                st.cover_t = 0.0;
+            }
+        }
+        // Duck back, then leave.
+        _ => {
+            if st.cover_t > 0.8 {
+                if cover.cover.is_some() {
+                    intent.cover = true;
+                }
+                info!("autopilot: left cover");
+                done(st);
+            }
+        }
+    }
+    true
 }

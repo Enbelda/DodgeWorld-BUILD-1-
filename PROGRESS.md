@@ -117,6 +117,50 @@
   - HUD hints while hanging / wall running; controls line added.
   - Being slimed, bricked, launched or dashing ends any parkour move.
 
+- **Milestone 2 follow-ups (play-test requests).** 158 game tests + 23 ranked, clippy clean.
+  Verified in the real app: classic and grand arenas offline with 3 bots on autopilot (cover
+  throws, parkour, catches), and a LAN host + drilling client (8 parkour laps, 4 throws
+  from a hang, no errors). Protocol 6.
+  - Hanging with a ball: you pull up so your head looks over the ledge, one hand flat on
+    it, the ball cocked back behind your head (thrown from over the ledge). Lock-on still
+    only while charging.
+  - Lock-on: starting a charge locks the enemy under the crosshair (else the nearest).
+    While charging, swinging the mouse toward another enemy switches to them (needs to be
+    clearly closer to the crosshair, so it doesn't flicker); the camera stops pulling
+    toward the target for 0.35 s after the mouse moves. Tab/MMB still cycle.
+  - Throw animation: torso coils back on the wind-up and whips through, free arm pulls
+    back, a step into the throw with the hips driving forward; small camera kick.
+  - Catch animation: the impact shoves the catcher back (push scaled by the ball's speed,
+    bots too), the body rocks back and both arms wrap the ball into the chest, hunched over
+    it, then ease back; a shockwave ring (gold for a perfect catch) and a camera jolt.
+  - Smoother movement: any wall move (wall run, wall jump, climb, hang, vault, climb up)
+    gives back the double jump and both dashes at once; an air dash carries its momentum
+    into the fall; jump buffering (0.12 s before landing) and coyote time (0.12 s after
+    walking off a ledge); the body turns smoothly to walls instead of snapping.
+  - Grand arena (lobby key V cycles classic day / classic night / grand day / grand
+    night, or `--grand`): 80 x 80 m, 10 m walls, 34 mirrored pieces of cover: low walls,
+    pillars, crates with step blocks, L-shaped bunkers, a 4 m wall-run corridor, four side
+    parkour panels with wall-to-wall corridors, two centre panels, long ledge walls.
+  - Cover (everyone): F next to a wall at least 1 m high takes cover: crouched against it
+    (a 1.1 m target, hidden behind the 1.2 m low walls), A/D slides along it. Hold LMB to
+    pre-charge with lock-on while hidden; you rise up and the throw goes over a low wall
+    (tilted up just enough to clear it), or curves around the nearer end of a tall one.
+    You duck again 0.45 s after throwing. F again, sprinting, jumping or dashing leaves.
+    F while charging is still a lob; F away from walls with a ball also lobs.
+  - Detail: procedural textures with normal maps and mipmaps (no image files): wooden
+    court floor with painted lines, centre circle and pad rings; brick low walls with
+    concrete caps; concrete blocks with lips; painted metal parkour panels with seams,
+    rivets and a dark grab stripe; glass outer walls in a metal frame (posts, top rail,
+    kick plate). Bloom on glowing things. Players: woven fabric clothes, soft skin
+    texture, collar, chest stripe, sleeve cuffs, wristbands, belt with buckle, white soles,
+    toe caps, sock cuffs, eyebrows, chin, glossy visor.
+  - Balls: smooth high-res spheres with a pebbled grip and seams (the boomerang is a ball
+    now, with a spinning band). Only while flying they turn fluid: stretched along the
+    path (volume kept), jiggling like jelly, spinning about the flight line, with
+    swirling wind streaks and a fading trail. Round again at rest and in hand. Held balls
+    sit in the holder's palm (cradled in both hands right after a catch). The brick is
+    unchanged.
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`
@@ -124,13 +168,15 @@
 - Host keys in warm-up: Enter start, B add bot, N remove bot, M mode, V map. After a match:
   Enter back to warm-up.
 - Esc frees the mouse; click to capture it again.
-- Testing aids: `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts),
+- Host keys in warm-up also: V cycles the map (classic/grand, day/night). `--grand` starts
+  on the grand arena.
+- Testing aids: `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts;
+  takes cover and throws over walls every fourth throw),
   `--drill` (autopilot loops the parkour drill on the +X flank),
   `--bind 127.0.0.1` (host on loopback only, no firewall prompt).
 
 ## In progress
-Nothing. Milestone 2 waiting for a human play-test of the feel (wall run speed/length, grab
-heights, climb-up timing).
+Milestone 3 (mounts) starting.
 
 ## Known bugs / limits
 - Movement is client-authoritative (fine for LAN with friends, not cheat-proof).
@@ -142,6 +188,10 @@ heights, climb-up timing).
 - Bots don't do parkour yet (they still play the ball game normally around the panels).
 - Parkour uses the arena's box list, so it only works on axis-aligned boxes (all current
   geometry); corners can't be wall run around.
+- Bots don't take cover. Remote players' charge wind-up isn't sent over the network (they
+  are seen holding, then throwing).
+- Taking cover behind a wall taller than 2.6 m: throws curve round its nearer end; there
+  is no lean-out-sideways pose yet.
 
 ## Next step
 Milestone 3: mounts (skateboard, BMX, inline skates, longboard, scooter, soap shoes) with

@@ -7,7 +7,7 @@ use crate::camera::FollowCamera;
 use crate::config::{LaunchConfig, Mode};
 use crate::net::{ClientNet, ClientStatus, HostNet};
 use crate::player::{LocalBody, FEET_OFFSET};
-use crate::sim::{Action, GameEvent, GameMode, Match, MapId, Phase, PlayerId, Snapshot, TrickState};
+use crate::sim::{Action, ArenaId, GameEvent, GameMode, Match, MapId, Phase, PlayerId, Snapshot, TrickState};
 
 const SIM_DT: f32 = 1.0 / 60.0;
 const SEND_INTERVAL: f32 = 1.0 / 30.0;
@@ -39,6 +39,8 @@ pub struct View {
     pub status: String,
     /// (time, message) kill feed.
     pub feed: Vec<(f64, String)>,
+    /// Events that arrived this frame (animations, push-back, effects).
+    pub events: Vec<GameEvent>,
 }
 
 impl View {
@@ -76,6 +78,9 @@ pub fn build_session(cfg: &LaunchConfig) -> Result<(Session, String), String> {
             }
             if cfg.night {
                 sim.set_map(MapId::Night);
+            }
+            if cfg.grand {
+                sim.set_arena(ArenaId::Grand);
             }
             let (net, status) = if *lan {
                 let ip = cfg.bind.unwrap_or([0, 0, 0, 0].into());
@@ -130,11 +135,10 @@ fn host_controls(
             sim.set_mode(next);
         }
         Phase::Lobby | Phase::Ended { .. } if keys.just_pressed(KeyCode::KeyV) => {
-            let next = match sim.map {
-                MapId::Day => MapId::Night,
-                MapId::Night => MapId::Day,
-            };
-            sim.set_map(next);
+            // Classic day -> classic night -> grand day -> grand night -> ...
+            let (arena, map) = next_map(sim.arena, sim.map);
+            sim.set_arena(arena);
+            sim.set_map(map);
         }
         Phase::Lobby => {
             if auto.0 && time.elapsed_secs() > 3.0 && peers_ready {
@@ -160,6 +164,16 @@ fn host_controls(
     }
 }
 
+/// The map after (`arena`, `map`) in the lobby's V cycle.
+pub fn next_map(arena: ArenaId, map: MapId) -> (ArenaId, MapId) {
+    match (arena, map) {
+        (ArenaId::Classic, MapId::Day) => (ArenaId::Classic, MapId::Night),
+        (ArenaId::Classic, MapId::Night) => (ArenaId::Grand, MapId::Day),
+        (ArenaId::Grand, MapId::Day) => (ArenaId::Grand, MapId::Night),
+        (ArenaId::Grand, MapId::Night) => (ArenaId::Classic, MapId::Day),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tick_session(
     time: Res<Time>,
@@ -170,6 +184,7 @@ fn tick_session(
     dash: Res<crate::player::LocalDash>,
     facing: Res<crate::player::LocalFacing>,
     parkour: Res<crate::player::LocalParkour>,
+    cover: Res<crate::player::LocalCover>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
@@ -186,6 +201,7 @@ fn tick_session(
             host.sim.set_trick(local, trick.0);
             host.sim.set_dash(local, dash.report());
             host.sim.set_parkour(local, parkour.0.pose());
+            host.sim.set_cover(local, cover.pose);
             for a in actions.0.drain(..) {
                 host.sim.apply(local, a);
             }
@@ -224,7 +240,7 @@ fn tick_session(
             for a in actions.0.drain(..) {
                 net.push_action(a);
             }
-            net.send_update(feet, yaw, trick.0, dash.report(), parkour.0.pose(), now);
+            net.send_update(feet, yaw, trick.0, dash.report(), parkour.0.pose(), cover.pose, now);
             if net.receive(now) {
                 if let Some(s) = net.latest.as_mut() {
                     new_events = std::mem::take(&mut s.events);
@@ -242,13 +258,14 @@ fn tick_session(
         }
     }
 
+    view.events = new_events.clone();
     for e in new_events {
         let msg = match e {
             GameEvent::Hit { thrower, target } => format!("{} hit {}", view.name_of(thrower), view.name_of(target)),
             GameEvent::Knockout { thrower, target } => {
                 format!("{} KNOCKED OUT {}", view.name_of(thrower), view.name_of(target))
             }
-            GameEvent::Caught { catcher, thrower, perfect } => {
+            GameEvent::Caught { catcher, thrower, perfect, .. } => {
                 let how = if perfect { "PERFECT-caught" } else { "caught" };
                 format!("{} {how} {}'s throw!", view.name_of(catcher), view.name_of(thrower))
             }
@@ -282,5 +299,22 @@ pub fn leave_on_exit(mut exit: MessageReader<AppExit>, session: Res<Session>) {
         if let Session::Client(net) = session.as_ref() {
             net.leave();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v_cycles_through_all_four_maps() {
+        let mut at = (ArenaId::Classic, MapId::Day);
+        let mut seen = vec![at];
+        for _ in 0..3 {
+            at = next_map(at.0, at.1);
+            assert!(!seen.contains(&at));
+            seen.push(at);
+        }
+        assert_eq!(next_map(at.0, at.1), (ArenaId::Classic, MapId::Day));
     }
 }

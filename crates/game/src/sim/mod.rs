@@ -9,7 +9,8 @@ use bevy::math::Vec3;
 use serde::{Deserialize, Serialize};
 
 use ball::{BallKind, ThrowParams, BALL_RADIUS};
-use layout::{Aabb, ARENA_HALF};
+pub use layout::ArenaId;
+use layout::Aabb;
 
 pub type PlayerId = u8;
 pub const MAX_PLAYERS: usize = 4;
@@ -27,6 +28,18 @@ pub const PICKUP_RADIUS: f32 = 1.3;
 /// Player body for hit tests: vertical capsule from feet to head.
 pub const BODY_RADIUS: f32 = 0.45;
 pub const BODY_HEIGHT: f32 = 1.8;
+/// Crouched in cover the body is this tall (hidden behind a 1.2 m low wall).
+pub const CROUCH_HEIGHT: f32 = 1.1;
+/// Where a held ball sits while hanging from a ledge (cocked behind the head, over the
+/// ledge), while crouched in cover, and risen up in cover to throw over the wall.
+pub const HANG_HOLD_HEIGHT: f32 = 1.9;
+pub const CROUCH_HOLD_HEIGHT: f32 = 0.85;
+pub const COVER_HOLD_HEIGHT: f32 = 1.75;
+/// Catching a ball pushes the catcher back by this fraction of its speed (m/s), capped.
+pub const CATCH_PUSH_SCALE: f32 = 0.22;
+pub const CATCH_PUSH_MAX: f32 = 9.0;
+/// How quickly a catch's push-back fades (per second).
+pub const RECOIL_DECAY: f32 = 6.0;
 /// Where a held ball sits relative to the holder's feet.
 pub const HOLD_HEIGHT: f32 = 1.3;
 /// The ball must come at the catcher's front half to be caught.
@@ -134,6 +147,17 @@ pub enum ParkourPose {
     Mantle,
 }
 
+/// Taking cover behind a wall, reported by the client.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum CoverPose {
+    #[default]
+    None,
+    /// Ducked behind it: a smaller target.
+    Crouched,
+    /// Risen up over it to throw.
+    Up,
+}
+
 /// A slimed player is dragged to `anchor` on the nearest wall and held there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slime {
@@ -173,6 +197,10 @@ pub struct Player {
     pub stun: f32,
     pub trick: Option<TrickState>,
     pub parkour: ParkourPose,
+    /// In cover (reported by the client): crouched is a smaller target.
+    pub cover: CoverPose,
+    /// Push-back from a catch (bots only; clients move their own body).
+    pub recoil: Vec3,
     /// Bumped on every hit taken, so clients can flash the model.
     pub hits: u32,
     /// > 0 while knocked out.
@@ -192,7 +220,24 @@ impl Player {
         Vec3::new(-self.yaw.sin(), 0.0, -self.yaw.cos())
     }
     pub fn hold_point(&self) -> Vec3 {
-        self.pos + Vec3::Y * HOLD_HEIGHT + self.forward() * 0.45
+        let h = if self.parkour == ParkourPose::Hang {
+            HANG_HOLD_HEIGHT
+        } else if self.cover == CoverPose::Crouched {
+            CROUCH_HOLD_HEIGHT
+        } else if self.cover == CoverPose::Up {
+            COVER_HOLD_HEIGHT
+        } else {
+            HOLD_HEIGHT
+        };
+        self.pos + Vec3::Y * h + self.forward() * 0.45
+    }
+    /// How tall the body is for hit tests (shorter while crouched in cover).
+    pub fn body_height(&self) -> f32 {
+        if self.cover == CoverPose::Crouched {
+            CROUCH_HEIGHT
+        } else {
+            BODY_HEIGHT
+        }
     }
     pub fn catching(&self) -> bool {
         self.catch_window > 0.0
@@ -256,7 +301,8 @@ impl Ball {
 pub enum GameEvent {
     Hit { thrower: PlayerId, target: PlayerId },
     Knockout { thrower: PlayerId, target: PlayerId },
-    Caught { catcher: PlayerId, thrower: PlayerId, perfect: bool },
+    /// `push` is the push-back the catcher feels (along the ball's flight).
+    Caught { catcher: PlayerId, thrower: PlayerId, perfect: bool, push: [f32; 3] },
     Tackled { by: PlayerId, target: PlayerId },
     KnockedBack { target: PlayerId },
     Slimed { thrower: PlayerId, target: PlayerId },
@@ -272,6 +318,7 @@ pub struct Match {
     pub phase: Phase,
     pub mode: GameMode,
     pub map: MapId,
+    pub arena: ArenaId,
     pub players: Vec<Player>,
     pub balls: Vec<Ball>,
     pub score: [u32; 2],
@@ -293,11 +340,12 @@ impl Match {
             phase: Phase::Lobby,
             mode: GameMode::Standard,
             map: MapId::Day,
+            arena: ArenaId::Classic,
             players: Vec::new(),
             balls: Vec::new(),
             score: [0, 0],
-            solids: layout::solids(),
-            cover: layout::cover(),
+            solids: layout::solids(ArenaId::Classic),
+            cover: layout::cover(ArenaId::Classic),
             events: Vec::new(),
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             next_id: 0,
@@ -307,7 +355,7 @@ impl Match {
     }
 
     pub fn reset_balls(&mut self) {
-        self.balls = layout::ball_pads()
+        self.balls = layout::ball_pads(self.arena)
             .into_iter()
             .map(|(pad, kind)| Ball::new(pad, kind))
             .collect();
@@ -336,7 +384,7 @@ impl Match {
             name: name.to_string(),
             team,
             bot,
-            pos: layout::spawn_point(team == Team::Red, slot),
+            pos: layout::spawn_point(self.arena, team == Team::Red, slot),
             yaw: if team == Team::Red { 0.0 } else { std::f32::consts::PI },
             hp: MAX_HP,
             holding: None,
@@ -354,6 +402,8 @@ impl Match {
             stun: 0.0,
             trick: None,
             parkour: ParkourPose::None,
+            cover: CoverPose::None,
+            recoil: Vec3::ZERO,
             hits: 0,
             respawn_timer: 0.0,
             teleports: 0,
@@ -398,13 +448,11 @@ impl Match {
     /// A human client reports where its body is (movement is client-side).
     /// While slimed or stunned the host owns the position; only the facing is taken.
     pub fn set_pose(&mut self, id: PlayerId, pos: Vec3, yaw: f32) {
+        let lim = self.arena.half() + 2.0;
         if let Some(p) = self.player_mut(id) {
             if p.alive() && pos.is_finite() && yaw.is_finite() && !p.helpless() {
                 p.yaw = yaw;
-                {
-                    let lim = ARENA_HALF + 2.0;
-                    p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
-                }
+                p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
             }
         }
     }
@@ -423,6 +471,13 @@ impl Match {
     pub fn set_parkour(&mut self, id: PlayerId, pose: ParkourPose) {
         if let Some(p) = self.player_mut(id) {
             p.parkour = pose;
+        }
+    }
+
+    /// A client reports whether it is in cover (crouched or risen up).
+    pub fn set_cover(&mut self, id: PlayerId, cover: CoverPose) {
+        if let Some(p) = self.player_mut(id) {
+            p.cover = if p.alive() && !p.helpless() { cover } else { CoverPose::None };
         }
     }
 
@@ -454,6 +509,28 @@ impl Match {
         }
         self.map = map;
         true
+    }
+
+    /// Switch arena geometry (between matches): new walls and pads, everyone back to spawn.
+    pub fn set_arena(&mut self, arena: ArenaId) -> bool {
+        if self.phase == Phase::Playing {
+            return false;
+        }
+        if self.arena != arena {
+            self.arena = arena;
+            self.solids = layout::solids(arena);
+            self.cover = layout::cover(arena);
+            self.reset_balls();
+            let ids: Vec<PlayerId> = self.players.iter().map(|p| p.id).collect();
+            for id in ids {
+                self.respawn(id);
+            }
+        }
+        true
+    }
+
+    pub fn half(&self) -> f32 {
+        self.arena.half()
     }
 
     /// Can a match start? Needs two players; teams are rebalanced on start.
@@ -542,7 +619,7 @@ impl Match {
         let team = self.players[idx].team;
         let slot = self.players[..idx].iter().filter(|p| p.team == team).count();
         let p = &mut self.players[idx];
-        p.pos = layout::spawn_point(team == Team::Red, slot);
+        p.pos = layout::spawn_point(self.arena, team == Team::Red, slot);
         p.yaw = if team == Team::Red { 0.0 } else { std::f32::consts::PI };
         p.hp = MAX_HP;
         p.respawn_timer = 0.0;
@@ -554,6 +631,8 @@ impl Match {
         p.stun = 0.0;
         p.trick = None;
         p.lock = None;
+        p.cover = CoverPose::None;
+        p.recoil = Vec3::ZERO;
         p.teleports = p.teleports.wrapping_add(1);
     }
 
@@ -601,7 +680,7 @@ impl Match {
                 if lob {
                     // Lobs drop onto the very top of the target's head.
                     if let Some(t) = aimed_at.and_then(|t| self.player(t)) {
-                        vel = ball::lob_to(origin, t.pos + Vec3::Y * (BODY_HEIGHT + 0.1));
+                        vel = ball::lob_to(origin, t.pos + Vec3::Y * (t.body_height() + 0.1));
                     }
                 } else {
                     vel = (vel * ball::stack_multiplier(self.balls[bi].stacks)).clamp_length_max(ball::MAX_BALL_SPEED);
@@ -660,12 +739,22 @@ impl Match {
         let respawns = self.respawns_enabled();
         let mut to_respawn = Vec::new();
         let solids = &self.solids;
+        let half = self.arena.half();
         for p in &mut self.players {
             p.stun = (p.stun - dt).max(0.0);
+            if p.recoil != Vec3::ZERO {
+                if p.bot && !p.helpless() {
+                    p.pos = bot::collide_feet(p.pos + p.recoil * dt, solids, half);
+                }
+                p.recoil *= (-RECOIL_DECAY * dt).exp();
+                if p.recoil.length() < 0.2 {
+                    p.recoil = Vec3::ZERO;
+                }
+            }
             if let Some(v) = p.knock.as_mut() {
                 v.y -= KNOCK_GRAVITY * dt;
                 p.pos += *v * dt;
-                p.pos = bot::collide_feet(Vec3::new(p.pos.x, p.pos.y, p.pos.z), solids).with_y(p.pos.y);
+                p.pos = bot::collide_feet(Vec3::new(p.pos.x, p.pos.y, p.pos.z), solids, half).with_y(p.pos.y);
                 if p.pos.y <= 0.0 && v.y < 0.0 {
                     p.pos.y = 0.0;
                     p.knock = None;
@@ -801,13 +890,14 @@ impl Match {
                     let alive_pos =
                         |id: Option<PlayerId>| id.and_then(|t| self.player(t)).filter(|t| t.alive()).map(|t| t.pos);
                     let (aim_at, track_pos) = (alive_pos(homing).map(|p| p + Vec3::Y * 1.0), alive_pos(track));
+                    let head = track.and_then(|t| self.player(t)).map_or(BODY_HEIGHT, |t| t.body_height());
                     let b = &mut self.balls[bi];
                     b.state = BallState::Live { thrower, team, curve, lob, powered, homing, track };
                     let mut bend = curve;
                     match (lob, track_pos) {
                         // A lob re-solves its arc every step to come down on top of the head.
                         (true, Some(feet)) => {
-                            ball::guide_lob(&mut b.vel, b.pos, feet + Vec3::Y * (BODY_HEIGHT + 0.1), g);
+                            ball::guide_lob(&mut b.vel, b.pos, feet + Vec3::Y * (head + 0.1), g);
                         }
                         // A curve bends out, then steers itself in (around cover if needed).
                         (false, Some(feet)) => {
@@ -890,7 +980,7 @@ impl Match {
             }
             // Escaped the arena somehow: put it back on its pad.
             let b = &mut self.balls[bi];
-            let lim = ARENA_HALF + 3.0;
+            let lim = self.arena.half() + 3.0;
             if b.pos.x.abs() > lim || b.pos.z.abs() > lim || b.pos.y < -5.0 || !b.pos.is_finite() {
                 if let BallState::Held { by } = b.state {
                     if let Some(p) = self.players.iter_mut().find(|p| p.id == by) {
@@ -911,7 +1001,7 @@ impl Match {
             .iter()
             .enumerate()
             .filter(|(_, p)| p.alive() && !p.dashing)
-            .filter_map(|(i, p)| segment_hits_body(a, b, p.pos).map(|t| (t, i)))
+            .filter_map(|(i, p)| segment_hits_body(a, b, p.pos, p.body_height()).map(|t| (t, i)))
             .min_by(|x, y| x.0.total_cmp(&y.0))
             .map(|(_, i)| i)
     }
@@ -940,7 +1030,10 @@ impl Match {
 
     /// `pi` catches ball `bi`. Pressed just before it arrived: a perfect catch.
     fn catch_ball(&mut self, bi: usize, pi: usize, thrower: PlayerId) {
+        let v = self.balls[bi].vel;
+        let push = (Vec3::new(v.x, 0.0, v.z) * CATCH_PUSH_SCALE).clamp_length_max(CATCH_PUSH_MAX);
         let t = &mut self.players[pi];
+        t.recoil = push;
         let perfect = CATCH_WINDOW - t.catch_window <= PERFECT_SECS;
         t.holding = Some(bi);
         t.powered = true;
@@ -952,7 +1045,7 @@ impl Match {
         b.state = BallState::Held { by: catcher };
         b.wrapping = false;
         b.stacks = if perfect { (b.stacks + 1).min(ball::MAX_STACKS) } else { 0 };
-        self.events.push(GameEvent::Caught { catcher, thrower, perfect });
+        self.events.push(GameEvent::Caught { catcher, thrower, perfect, push: push.to_array() });
     }
 
     /// The enemy (of `team`) whose body the ball's path from `a` to `b` crosses first.
@@ -961,7 +1054,7 @@ impl Match {
             .iter()
             // Dashing players are invincible: balls pass through them.
             .filter(|p| p.team != team && p.alive() && !p.dashing)
-            .filter_map(|p| segment_hits_body(a, b, p.pos).map(|t| (t, p.id)))
+            .filter_map(|p| segment_hits_body(a, b, p.pos, p.body_height()).map(|t| (t, p.id)))
             .min_by(|x, y| x.0.total_cmp(&y.0))
             .map(|(_, id)| id)
     }
@@ -1015,6 +1108,7 @@ impl Match {
             }
             if kind == BallKind::Slime {
                 let anchor = layout::nearest_wall_anchor(self.players[ti].pos, &self.solids, BODY_RADIUS);
+                self.players[ti].cover = CoverPose::None;
                 self.players[ti].slime = Some(Slime { anchor, timer: SLIME_SECS });
                 self.events.push(GameEvent::Slimed { thrower, target });
             }
@@ -1078,6 +1172,7 @@ impl Match {
             phase: self.phase,
             mode: self.mode,
             map: self.map,
+            arena: self.arena,
             score: self.score,
             players: self
                 .players
@@ -1101,6 +1196,7 @@ impl Match {
                     dashing: p.dashing,
                     trick: p.trick,
                     parkour: if p.alive() && !p.helpless() { p.parkour } else { ParkourPose::None },
+                    cover: if p.alive() && !p.helpless() { p.cover } else { CoverPose::None },
                     hits: p.hits,
                     catch_cooldown: p.catch_cooldown,
                     respawn_timer: p.respawn_timer.max(0.0),
@@ -1126,11 +1222,11 @@ impl Match {
     }
 }
 
-/// Where along segment a->b (0..1) the ball first touches a standing body at `feet`.
-pub fn segment_hits_body(a: Vec3, b: Vec3, feet: Vec3) -> Option<f32> {
+/// Where along segment a->b (0..1) the ball first touches a body `height` tall at `feet`.
+pub fn segment_hits_body(a: Vec3, b: Vec3, feet: Vec3, height: f32) -> Option<f32> {
     let r = BODY_RADIUS + BALL_RADIUS;
     let bottom = feet + Vec3::Y * BODY_RADIUS;
-    let top = feet + Vec3::Y * (BODY_HEIGHT - BODY_RADIUS);
+    let top = feet + Vec3::Y * (height - BODY_RADIUS).max(BODY_RADIUS);
     // Sample the segment; steps are short (sub-frame), so 8 samples is plenty.
     (0..=8).map(|i| i as f32 / 8.0).find(|&t| {
         let p = a.lerp(b, t);
@@ -1146,6 +1242,7 @@ pub struct Snapshot {
     pub phase: Phase,
     pub mode: GameMode,
     pub map: MapId,
+    pub arena: ArenaId,
     pub score: [u32; 2],
     pub players: Vec<PlayerView>,
     pub balls: Vec<BallView>,
@@ -1177,6 +1274,7 @@ pub struct PlayerView {
     pub dashing: bool,
     pub trick: Option<TrickState>,
     pub parkour: ParkourPose,
+    pub cover: CoverPose,
     pub hits: u32,
     pub respawn_timer: f32,
     pub teleports: u32,
@@ -1613,7 +1711,7 @@ mod tests {
         // Blue stood at x=14, z=-10: the cover block at (9, -12) is nearer than the x=20 wall.
         let expected = layout::nearest_wall_anchor(LANE + Vec3::new(0.0, 0.0, -10.0), &m.solids, BODY_RADIUS);
         assert_eq!(slime.anchor, expected);
-        assert!(expected.distance(LANE + Vec3::new(0.0, 0.0, -10.0)) < ARENA_HALF - LANE.x, "{expected}");
+        assert!(expected.distance(LANE + Vec3::new(0.0, 0.0, -10.0)) < layout::ARENA_HALF - LANE.x, "{expected}");
         run(&mut m, 0.6);
         let b = m.player(blue).unwrap();
         assert!((b.pos.x - slime.anchor.x).abs() < 1e-3, "dragged to the wall");
@@ -1893,9 +1991,13 @@ mod tests {
     #[test]
     fn segment_body_test() {
         let feet = Vec3::new(0.0, 0.0, -5.0);
-        assert!(segment_hits_body(Vec3::new(0.0, 1.0, -4.0), Vec3::new(0.0, 1.0, -6.0), feet).is_some());
-        assert!(segment_hits_body(Vec3::new(2.0, 1.0, -4.0), Vec3::new(2.0, 1.0, -6.0), feet).is_none());
-        assert!(segment_hits_body(Vec3::new(0.0, 3.0, -4.0), Vec3::new(0.0, 3.0, -6.0), feet).is_none());
+        assert!(segment_hits_body(Vec3::new(0.0, 1.0, -4.0), Vec3::new(0.0, 1.0, -6.0), feet, BODY_HEIGHT).is_some());
+        assert!(segment_hits_body(Vec3::new(2.0, 1.0, -4.0), Vec3::new(2.0, 1.0, -6.0), feet, BODY_HEIGHT).is_none());
+        assert!(segment_hits_body(Vec3::new(0.0, 3.0, -4.0), Vec3::new(0.0, 3.0, -6.0), feet, BODY_HEIGHT).is_none());
+        // Crouched: a ball skimming a 1.2 m wall (centre at 1.6 m) flies over.
+        let high = (Vec3::new(0.0, 1.6, -4.0), Vec3::new(0.0, 1.6, -6.0));
+        assert!(segment_hits_body(high.0, high.1, feet, BODY_HEIGHT).is_some());
+        assert!(segment_hits_body(high.0, high.1, feet, CROUCH_HEIGHT).is_none());
     }
 
     #[test]
