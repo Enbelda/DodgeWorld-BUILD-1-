@@ -362,8 +362,9 @@ fn update_hud(
                         BallKind::Brick => " BRICK",
                     });
                     let ball = match (m.holding, m.powered, m.charged) {
+                        (true, true, true) => format!("BALL{kind} (POWERED + CHARGED: click to throw!)"),
                         (true, true, _) => format!("BALL{kind} (POWERED!)"),
-                        (true, _, true) => format!("BALL{kind} (CHARGED)"),
+                        (true, _, true) => format!("BALL{kind} (CHARGED: click to throw!)"),
                         (true, _, _) => format!("BALL{kind}"),
                         _ => "no ball".to_string(),
                     };

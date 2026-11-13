@@ -161,6 +161,7 @@ fn sync_balls(
     palette: Res<Palette>,
     body: Single<&Transform, (With<LocalBody>, Without<BallVis>)>,
     cam: Single<&FollowCamera>,
+    facing: Res<crate::player::LocalFacing>,
     mut balls: Query<(Entity, &BallVis, &mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
     mut spin: Local<f32>,
 ) {
@@ -179,7 +180,8 @@ fn sync_balls(
         match b.state {
             // Our own held ball follows our body without network lag.
             BallState::Held { by } if Some(by) == view.local => {
-                let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
+                let yaw = facing.body_yaw(cam.yaw);
+                let forward = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
                 tf.translation = body.translation - Vec3::Y * FEET_OFFSET + Vec3::Y * HOLD_HEIGHT + forward * 0.45;
             }
             _ if view.is_host || tf.translation.distance(target) > 3.0 => tf.translation = target,

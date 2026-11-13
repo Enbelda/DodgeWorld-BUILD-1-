@@ -4,7 +4,9 @@
 //! double jump with a flip), hold Left Mouse to charge (locks the nearest enemy while charging)
 //! and release to throw, hold Q / E while throwing to curve, F to lob, Right Mouse to catch
 //! (time it), Tab / Middle Mouse while charging to switch target.
-//! In the air: Q / E spin 180 left / right; W+Q/E front flip, S+Q/E back flip.
+//! In the air: Q / E spin the body 180 left / right (the camera stays put); W+Q/E front flip,
+//! S+Q/E back flip. After a perfect catch (or a returning boomerang) the ball is already
+//! fully charged: a click throws it at once.
 
 use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
@@ -72,7 +74,35 @@ pub struct MoveIntent {
     pub sprint: bool,
     /// Ctrl pressed.
     pub dash: bool,
+    /// Charging or catching: the body turns back to face where the camera looks.
+    pub face_camera: bool,
 }
+
+/// How far the body is turned away from the camera's yaw (a spin turns the body only).
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct LocalFacing(pub f32);
+
+impl LocalFacing {
+    /// The yaw the body faces, given the camera's.
+    pub fn body_yaw(&self, cam_yaw: f32) -> f32 {
+        cam_yaw + self.0
+    }
+
+    /// Turn back toward the camera's facing (the short way round).
+    pub fn settle(&mut self, dt: f32) {
+        let mut d = self.0 % std::f32::consts::TAU;
+        if d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        } else if d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        d *= (-FACING_SETTLE_RATE * dt).exp();
+        self.0 = if d.abs() < 0.01 { 0.0 } else { d };
+    }
+}
+
+/// How quickly a spun body turns back to the camera once you move, charge or catch.
+const FACING_SETTLE_RATE: f32 = 10.0;
 
 /// The local player's dashes: two charges, a short gap between them, and both come back
 /// `DASH_RECHARGE` seconds after the last dash.
@@ -156,6 +186,7 @@ impl Plugin for PlayerPlugin {
             .init_resource::<Autopilot>()
             .init_resource::<LockOn>()
             .init_resource::<LocalDash>()
+            .init_resource::<LocalFacing>()
             .add_systems(Startup, spawn_local_body)
             .add_systems(
                 Update,
@@ -381,6 +412,7 @@ fn keyboard_intent(
     intent.jump = keys.just_pressed(KeyCode::Space);
     intent.sprint = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     intent.dash = keys.just_pressed(KeyCode::ControlLeft) || keys.just_pressed(KeyCode::ControlRight);
+    intent.face_camera = mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Right);
     // While charging a throw, Q/E curve the ball instead of doing tricks.
     let charging = mouse.pressed(MouseButton::Left);
     intent.trick = match (keys.just_pressed(KeyCode::KeyQ), keys.just_pressed(KeyCode::KeyE)) {
@@ -390,14 +422,15 @@ fn keyboard_intent(
     };
 }
 
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn move_local_body(
     time: Res<Time>,
     intent: Res<MoveIntent>,
     view: Res<View>,
     mut trick: ResMut<LocalTrick>,
     mut dash: ResMut<LocalDash>,
-    mut cam: Single<&mut FollowCamera>,
+    mut facing: ResMut<LocalFacing>,
+    cam: Single<&FollowCamera>,
     body: Single<(
         &mut LocalBody,
         &mut Transform,
@@ -408,7 +441,7 @@ pub fn move_local_body(
     let dt = time.delta_secs().min(0.05);
     let (mut b, mut tf, mut controller, output) = body.into_inner();
     let me = view.me();
-    tf.rotation = Quat::from_rotation_y(cam.yaw);
+    tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
     dash.tick(dt);
     if !me.is_none_or(|m| m.alive()) {
         controller.translation = None;
@@ -466,7 +499,11 @@ pub fn move_local_body(
             trick.0 = Some(TrickState { kind: air_trick(fwd_amount, side), progress: 0.0 });
         }
     }
-    advance_trick(&mut trick.0, &mut cam.yaw, grounded, dt);
+    // Spins turn only the body; it turns back once you move, charge or catch.
+    advance_trick(&mut trick.0, &mut facing.0, grounded, dt);
+    if trick.0.is_none() && (intent.face_camera || (grounded && intent.dir.length_squared() > 0.01)) {
+        facing.settle(dt);
+    }
 
     b.vel_y -= GRAVITY * dt;
     let speed = MOVE_SPEED * move_multiplier(intent.sprint, !grounded && b.sprint_jump);
@@ -483,8 +520,8 @@ pub fn move_multiplier(sprint: bool, sprint_jump: bool) -> f32 {
     }
 }
 
-/// Move a trick along. Spins turn the player (and camera) 180 degrees as they go.
-/// Flips end early on landing.
+/// Move a trick along. Spins turn `yaw` (the body's offset from the camera) 180 degrees as
+/// they go. Flips end early on landing.
 pub fn advance_trick(trick: &mut Option<TrickState>, yaw: &mut f32, grounded: bool, dt: f32) {
     let Some(t) = trick.as_mut() else { return };
     let before = t.progress;
@@ -565,28 +602,44 @@ fn combat_input(
     if charge.started.is_none() && !mouse.just_pressed(MouseButton::Left) {
         release_lock(&mut lock, &mut actions);
     }
+    // Already charged (perfect catch / boomerang): the click throws at full power right away.
+    if me.charged && mouse.just_pressed(MouseButton::Left) {
+        lock_nearest(&view, me, feet, &mut lock, &mut actions);
+        let aim = lock
+            .0
+            .and_then(|t| view.snap.as_ref()?.players.iter().find(|p| p.id == t))
+            .map(|p| (Vec3::from_array(p.pos) + Vec3::Y * 1.0 - hold).normalize_or(forward).to_array())
+            .unwrap_or(aim);
+        actions.0.push(Action::Throw { aim, charge: 1.0, curve, lob: false });
+        charge.started = None;
+        release_lock(&mut lock, &mut actions);
+        return;
+    }
     if mouse.just_pressed(MouseButton::Left) {
         charge.started = Some(now);
         // Starting a charge locks on to the nearest enemy.
-        {
-            let enemies: Vec<(PlayerId, Vec3)> = view
-                .snap
-                .iter()
-                .flat_map(|s| s.players.iter())
-                .filter(|p| p.team != me.team && p.alive())
-                .map(|p| (p.id, Vec3::from_array(p.pos)))
-                .collect();
-            if let Some(t) = nearest_enemy(&enemies, feet) {
-                lock.0 = Some(t);
-                actions.0.push(Action::Lock { target: Some(t) });
-            }
-        }
+        lock_nearest(&view, me, feet, &mut lock, &mut actions);
     }
     if mouse.just_released(MouseButton::Left) {
         let amount = charge.amount(now).unwrap_or(0.0);
         actions.0.push(Action::Throw { aim, charge: amount, curve, lob: false });
         charge.started = None;
         release_lock(&mut lock, &mut actions);
+    }
+}
+
+/// Lock on to the nearest living enemy, if one is in range.
+fn lock_nearest(view: &View, me: &crate::sim::PlayerView, feet: Vec3, lock: &mut LockOn, actions: &mut LocalActions) {
+    let enemies: Vec<(PlayerId, Vec3)> = view
+        .snap
+        .iter()
+        .flat_map(|s| s.players.iter())
+        .filter(|p| p.team != me.team && p.alive())
+        .map(|p| (p.id, Vec3::from_array(p.pos)))
+        .collect();
+    if let Some(t) = nearest_enemy(&enemies, feet) {
+        lock.0 = Some(t);
+        actions.0.push(Action::Lock { target: Some(t) });
     }
 }
 
@@ -678,6 +731,16 @@ mod tests {
             advance_trick(&mut t, &mut yaw, false, 1.0 / 60.0);
         }
         assert!((yaw + std::f32::consts::PI).abs() < 1e-4);
+    }
+
+    #[test]
+    fn spun_body_settles_back_the_short_way() {
+        let mut f = LocalFacing(std::f32::consts::PI * 3.0 - 0.2); // spun one and a half times
+        for _ in 0..120 {
+            f.settle(1.0 / 60.0);
+        }
+        assert_eq!(f.0, 0.0);
+        assert!((LocalFacing(1.0).body_yaw(0.5) - 1.5).abs() < 1e-6);
     }
 
     #[test]

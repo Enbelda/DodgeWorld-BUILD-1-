@@ -77,6 +77,24 @@
   - Sprint (Shift) 1.4x; a jump taken while sprinting carries 1.24x farther, dashes too.
   - Protocol 4.
 
+- **Milestone 1 round 5 (fourth play-test requests).** 120 game tests + 23 ranked, clippy clean,
+  autopilot match run with no errors.
+  - Lob: leaves the hand 40% faster and the whole arc is flown 40% faster (same height). It
+    re-solves its path every step, so it comes down on top of the target's head even if they
+    run. Dashing at any moment during the flight shakes it off for good.
+  - Curve: 40% faster again (bend kept the same). It bends out, then steers itself in during
+    the last 0.35 s with guidance that always closes the gap; goes around cover as before.
+    A dash shakes it off too. (Catching still works against both.)
+  - Bodies: real joint chain (spine, neck, shoulders, elbows, wrists, hips, knees, ankles),
+    hands with a palm, four two-jointed fingers and a thumb, rounded joint capsules connecting
+    every segment, biceps/forearm/calf shapes, kneecaps, jaw, ears, nose, hair, shoes. Running
+    lean, breathing, gripping the held ball, open hands to catch, fingers letting go on a throw.
+  - Air spin (Q/E) turns only the body 180 degrees; the camera stays put. The body turns back
+    to the camera once you move on the ground, charge or catch. (Catch uses the body's facing,
+    so a spin can catch a ball coming from behind.)
+  - Perfect catch (and a returning boomerang): the ball is already fully charged, so a single
+    click throws it at full power immediately. The next ball picked up charges normally.
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`

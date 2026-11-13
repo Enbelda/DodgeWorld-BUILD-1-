@@ -583,7 +583,8 @@ impl Match {
                 } else {
                     vel = (vel * ball::stack_multiplier(self.balls[bi].stacks)).clamp_length_max(ball::MAX_BALL_SPEED);
                 }
-                let track = if curve != 0.0 { aimed_at } else { None };
+                // Curves and lobs track their target (a dash shakes them off).
+                let track = if curve != 0.0 || lob { aimed_at } else { None };
                 let b = &mut self.balls[bi];
                 b.pos = origin;
                 b.vel = vel;
@@ -764,27 +765,48 @@ impl Match {
                         ball::step(&mut b.pos, &mut b.vel, 0.0, g, dt, &self.solids);
                     }
                 }
-                BallState::Live { thrower, team, curve, lob, powered, homing, track } => {
+                BallState::Live { thrower, team, curve, lob, powered, mut homing, mut track } => {
                     let g = ball::gravity(lob, true);
-                    let chest_of = |id: Option<PlayerId>| {
-                        id.and_then(|t| self.player(t)).filter(|t| t.alive()).map(|t| t.pos + Vec3::Y * 1.0)
-                    };
-                    let (aim_at, track_at) = (chest_of(homing), chest_of(track));
-                    let b = &mut self.balls[bi];
-                    if let Some(target) = aim_at {
-                        ball::home(&mut b.vel, target - b.pos, dt, lob);
+                    // Dashing out of the way shakes off a tracking ball for good.
+                    let dashing = |id: Option<PlayerId>| id.and_then(|t| self.player(t)).is_some_and(|t| t.dashing);
+                    if dashing(track) {
+                        track = None;
                     }
-                    // A curved throw at someone behind cover swings around it, then tracks them.
+                    if dashing(homing) {
+                        homing = None;
+                    }
+                    let alive_pos =
+                        |id: Option<PlayerId>| id.and_then(|t| self.player(t)).filter(|t| t.alive()).map(|t| t.pos);
+                    let (aim_at, track_pos) = (alive_pos(homing).map(|p| p + Vec3::Y * 1.0), alive_pos(track));
+                    let b = &mut self.balls[bi];
+                    b.state = BallState::Live { thrower, team, curve, lob, powered, homing, track };
                     let mut bend = curve;
-                    if let Some(target) = track_at {
-                        let side = -curve.signum();
-                        if let Some(wp) = ball::wrap_waypoint(b.pos, target, side, &self.cover) {
-                            b.wrapping = true;
-                            ball::steer_flat(&mut b.vel, wp - b.pos, ball::WRAP_TURN_RATE, dt);
-                            bend = 0.0;
-                        } else if b.wrapping {
-                            ball::turn_toward(&mut b.vel, target - b.pos, ball::TRACK_TURN_RATE, dt, false);
-                            bend = 0.0;
+                    match (lob, track_pos) {
+                        // A lob re-solves its arc every step to come down on top of the head.
+                        (true, Some(feet)) => {
+                            ball::guide_lob(&mut b.vel, b.pos, feet + Vec3::Y * (BODY_HEIGHT + 0.1), g);
+                        }
+                        // A curve bends out, then steers itself in (around cover if needed).
+                        (false, Some(feet)) => {
+                            let target = feet + Vec3::Y * 1.0;
+                            let side = -curve.signum();
+                            if let Some(wp) = ball::wrap_waypoint(b.pos, target, side, &self.cover) {
+                                b.wrapping = true;
+                                ball::steer_flat(&mut b.vel, wp - b.pos, ball::WRAP_TURN_RATE, dt);
+                                bend = 0.0;
+                            } else {
+                                let to = target - b.pos;
+                                let eta = to.length() / b.vel.length().max(1.0);
+                                if b.wrapping || eta < ball::CURVE_HOME_ETA {
+                                    ball::guide_to(&mut b.vel, to, eta, dt);
+                                    bend = 0.0;
+                                }
+                            }
+                        }
+                        _ => {
+                            if let Some(target) = aim_at {
+                                ball::home(&mut b.vel, target - b.pos, dt, lob);
+                            }
                         }
                     }
                     let prev = b.pos;
@@ -1791,6 +1813,48 @@ mod tests {
         assert!(matches!(m.balls[0].state, BallState::Live { track: Some(t), .. } if t == blue));
         run(&mut m, 1.5);
         assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "went around the pillar");
+    }
+
+    /// Blue keeps running sideways at sprint speed while a ball is in the air.
+    fn run_strafing(m: &mut Match, blue: PlayerId, speed: f32, secs: f32) {
+        for _ in 0..(secs / DT) as usize {
+            let p = m.player(blue).unwrap().pos;
+            m.set_pose(blue, p + Vec3::X * speed * DT, 0.0);
+            m.step(DT);
+        }
+    }
+
+    #[test]
+    fn lob_tracks_a_runner_onto_the_head() {
+        let (mut m, red, blue) = duel();
+        m.apply(red, Action::Throw { aim: [0.0, 0.0, -1.0], charge: 0.0, curve: 0.0, lob: true });
+        assert!(matches!(m.balls[0].state, BallState::Live { track: Some(t), .. } if t == blue));
+        run_strafing(&mut m, blue, -9.8, 1.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "the lob followed blue");
+    }
+
+    #[test]
+    fn curve_tracks_a_runner() {
+        let (mut m, red, blue) = duel();
+        m.apply(red, Action::Throw { aim: [0.0, -0.02, -1.0], charge: 0.3, curve: -1.0, lob: false });
+        run_strafing(&mut m, blue, -9.8, 1.5);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "the curve followed blue");
+    }
+
+    #[test]
+    fn dashing_shakes_off_a_tracking_lob() {
+        let (mut m, red, blue) = duel();
+        m.apply(red, Action::Throw { aim: [0.0, 0.0, -1.0], charge: 0.0, curve: 0.0, lob: true });
+        run(&mut m, 0.3);
+        // Blue dashes 6 m sideways mid-flight.
+        m.set_dash(blue, Some(1));
+        let p = m.player(blue).unwrap().pos;
+        m.set_pose(blue, p + Vec3::X * 6.0, 0.0);
+        m.step(DT);
+        m.set_dash(blue, None);
+        assert!(matches!(m.balls[0].state, BallState::Live { track: None, .. }), "tracking lost");
+        run(&mut m, 2.0);
+        assert_eq!(m.player(blue).unwrap().hp, MAX_HP, "dodged");
     }
 
     #[test]

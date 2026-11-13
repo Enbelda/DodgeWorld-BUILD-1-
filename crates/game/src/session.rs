@@ -168,12 +168,14 @@ fn tick_session(
     mut actions: ResMut<LocalActions>,
     trick: Res<LocalTrick>,
     dash: Res<crate::player::LocalDash>,
+    facing: Res<crate::player::LocalFacing>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
     let now = time.elapsed_secs_f64();
     let feet = body.translation - Vec3::Y * FEET_OFFSET;
-    let yaw = cam.yaw;
+    // Report where the body faces (a spin turns the body, not the camera).
+    let yaw = facing.body_yaw(cam.yaw);
     let mut new_events = Vec::new();
 
     match session.as_mut() {

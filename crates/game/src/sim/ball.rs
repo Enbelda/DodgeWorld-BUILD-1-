@@ -45,20 +45,36 @@ pub const POWER_BONUS: f32 = 6.0;
 pub const SPECIAL_SPEED: f32 = 1.3;
 /// ...and bend this much more (+40%) on top of the earlier +30% tuning.
 pub const SPECIAL_BEND: f32 = 1.4;
-/// Curve tuning before this round: 26 m/s^2 sideways, 0.22 rad launch offset, both x1.3.
+/// Round 5: curved and lobbed throws leave the hand another 40% faster.
+pub const FAST_SPECIAL: f32 = 1.4;
+/// Speed of a curved throw relative to a straight one (x1.3 then x1.4).
+pub const CURVE_SPEED: f32 = SPECIAL_SPEED * FAST_SPECIAL;
+/// Curve tuning before round 4: 26 m/s^2 sideways, 0.22 rad launch offset, both x1.3.
 const PREV_CURVE_ACCEL: f32 = 26.0 * 1.3;
 const PREV_CURVE_OFFSET: f32 = 0.22 * 1.3;
 /// Sideways acceleration at full curve, m/s^2. Path bend goes with accel / speed^2, so the
 /// faster ball needs SPECIAL_SPEED^2 more accel to keep bending, times SPECIAL_BEND.
-pub const CURVE_ACCEL: f32 = PREV_CURVE_ACCEL * SPECIAL_BEND * SPECIAL_SPEED * SPECIAL_SPEED;
+/// Round 5 scales it by FAST_SPECIAL^2 again so the 40% faster ball keeps the same bend.
+pub const CURVE_ACCEL: f32 = PREV_CURVE_ACCEL * SPECIAL_BEND * CURVE_SPEED * CURVE_SPEED;
+/// A tracked curve stops bending and steers itself in once it is this close (seconds).
+pub const CURVE_HOME_ETA: f32 = 0.35;
+/// Guidance gain: the turn rate is at least GUIDE_GAIN * angle / time-to-target, so the
+/// remaining error closes before the ball arrives.
+pub const GUIDE_GAIN: f32 = 3.0;
 /// How far a curved throw starts angled away from the aim (it bends back).
 pub const CURVE_LAUNCH_OFFSET: f32 = PREV_CURVE_OFFSET * SPECIAL_BEND;
 /// Lob tuning before this round (14 m/s at 0.85 rad, arc height x1.3).
 const PREV_LOB_FORWARD: f32 = 9.2398;
 const PREV_LOB_UP: f32 = 10.5179 * 1.140_175;
-/// Lob launch: forward speed x1.3; arc height x1.4 (height goes with up-speed squared).
-pub const LOB_FORWARD_SPEED: f32 = PREV_LOB_FORWARD * SPECIAL_SPEED;
-pub const LOB_UP_SPEED: f32 = PREV_LOB_UP * 1.183_216; // sqrt(SPECIAL_BEND)
+/// Lob launch: forward speed x1.3; arc height x1.4 (height goes with up-speed squared);
+/// round 5: the whole lob 40% faster (launch speed x1.4, gravity x1.4^2 so the arc keeps
+/// its height and shape but is flown in 1/1.4 of the time).
+pub const LOB_FORWARD_SPEED: f32 = PREV_LOB_FORWARD * SPECIAL_SPEED * FAST_SPECIAL;
+pub const LOB_UP_SPEED: f32 = PREV_LOB_UP * 1.183_216 * FAST_SPECIAL; // sqrt(SPECIAL_BEND)
+/// Gravity on a live lob.
+pub const LOB_GRAVITY: f32 = FULL_GRAVITY * FAST_SPECIAL * FAST_SPECIAL;
+/// A tracking lob can drift sideways at most this fast to stay over its target's head.
+pub const LOB_MAX_FLAT_SPEED: f32 = 45.0;
 /// How fast a locked-on throw turns toward its target, radians per second.
 pub const HOMING_RATE: f32 = 1.2;
 /// Speed of a boomerang flying back to its thrower.
@@ -103,7 +119,7 @@ pub fn launch(aim: Vec3, p: ThrowParams) -> (Vec3, f32) {
     // A curved ball flies faster and starts angled away so it bends back toward the aim.
     let right = aim.cross(Vec3::Y).normalize_or(Vec3::X);
     let curve = p.curve.clamp(-1.0, 1.0);
-    speed *= 1.0 + (SPECIAL_SPEED - 1.0) * curve.abs();
+    speed *= 1.0 + (CURVE_SPEED - 1.0) * curve.abs();
     let dir = (aim - right * curve * CURVE_LAUNCH_OFFSET).normalize();
     (dir * speed, curve)
 }
@@ -117,14 +133,39 @@ pub fn stack_multiplier(stacks: u8) -> f32 {
 /// the normal lob height and the forward speed is solved so the ball falls onto the point.
 pub fn lob_to(from: Vec3, target: Vec3) -> Vec3 {
     let up = LOB_UP_SPEED;
-    let g = FULL_GRAVITY;
+    let g = LOB_GRAVITY;
     let drop = from.y - target.y;
     // Time until the falling ball is at the target height.
     let disc = up * up + 2.0 * g * drop;
     let t = if disc > 0.0 { (up + disc.sqrt()) / g } else { up / g };
     let flat = Vec3::new(target.x - from.x, 0.0, target.z - from.z);
-    let speed = (flat.length() / t.max(0.05)).clamp(2.0, 30.0);
+    let speed = (flat.length() / t.max(0.05)).clamp(2.0, LOB_MAX_FLAT_SPEED);
     flat.normalize_or(Vec3::NEG_Z) * speed + Vec3::Y * up
+}
+
+/// Keep a lob on course for `head` (re-solved every step, so it follows a moving target):
+/// sets the sideways velocity that brings the ball down onto that point.
+pub fn guide_lob(vel: &mut Vec3, pos: Vec3, head: Vec3, g: f32) {
+    let disc = vel.y * vel.y + 2.0 * g * (pos.y - head.y);
+    if disc < 0.0 {
+        return;
+    }
+    let t = (vel.y + disc.sqrt()) / g;
+    if t <= 1e-3 {
+        return; // already at or below the head on the way down
+    }
+    let flat = Vec3::new(head.x - pos.x, 0.0, head.z - pos.z);
+    let v = (flat / t).clamp_length_max(LOB_MAX_FLAT_SPEED);
+    vel.x = v.x;
+    vel.z = v.z;
+}
+
+/// Steer a ball that is `eta` seconds out so it is sure to reach `to_target`: the turn rate
+/// grows as the ball closes in, so whatever angle is left is gone before it arrives.
+pub fn guide_to(vel: &mut Vec3, to_target: Vec3, eta: f32, dt: f32) {
+    let angle = vel.normalize_or_zero().angle_between(to_target.normalize_or_zero());
+    let rate = TRACK_TURN_RATE.max(GUIDE_GAIN * angle / eta.max(dt));
+    turn_toward(vel, to_target, rate, dt, false);
 }
 
 /// Bounce off a wall with normal `n`, twice as fast, capped.
@@ -209,10 +250,10 @@ pub fn wrap_waypoint(pos: Vec3, target: Vec3, side: f32, cover: &[Aabb]) -> Opti
 
 /// Gravity for a ball in flight.
 pub fn gravity(lob: bool, live: bool) -> f32 {
-    if live && !lob {
-        THROW_GRAVITY
-    } else {
-        FULL_GRAVITY
+    match (live, lob) {
+        (true, false) => THROW_GRAVITY,
+        (true, true) => LOB_GRAVITY,
+        _ => FULL_GRAVITY,
     }
 }
 
@@ -413,7 +454,7 @@ mod tests {
         let mut peak: f32 = 0.0;
         let mut landed = false;
         for _ in 0..240 {
-            let r = step(&mut pos, &mut vel, c, FULL_GRAVITY, 1.0 / 60.0, &[]);
+            let r = step(&mut pos, &mut vel, c, LOB_GRAVITY, 1.0 / 60.0, &[]);
             peak = peak.max(pos.y);
             if r.touched {
                 landed = true;
@@ -440,10 +481,11 @@ mod tests {
     }
 
     #[test]
-    fn curved_throw_is_thirty_percent_faster() {
+    fn curved_throw_is_faster_again() {
         let (straight, _) = launch(Vec3::NEG_Z, throw(0.5, 0.0, false));
         let (curved, _) = launch(Vec3::NEG_Z, throw(0.5, 1.0, false));
-        assert!((curved.length() / straight.length() - 1.3).abs() < 1e-4);
+        // x1.3 (round 3) then 40% faster (round 5).
+        assert!((curved.length() / straight.length() - 1.3 * 1.4).abs() < 1e-4);
     }
 
     /// Sideways distance a full curve travels away from (and back to) the aim line.
@@ -457,11 +499,11 @@ mod tests {
     fn curve_bends_forty_percent_more_over_the_same_distance() {
         // Path curvature ~ accel / speed^2 must grow by 1.4 even though the ball is 1.3x faster.
         let old = PREV_CURVE_ACCEL / (26.0_f32 * 26.0);
-        let new = CURVE_ACCEL / (26.0_f32 * 1.3 * 26.0 * 1.3);
+        let new = CURVE_ACCEL / (26.0_f32 * CURVE_SPEED * 26.0 * CURVE_SPEED);
         assert!((new / old - 1.4).abs() < 1e-3);
         assert!((CURVE_LAUNCH_OFFSET / PREV_CURVE_OFFSET - 1.4).abs() < 1e-4);
         // Sanity: the outward bulge is not absurd at full charge.
-        let bulge = max_side_offset(CURVE_ACCEL / PREV_CURVE_ACCEL, MAX_THROW_SPEED * 1.3, CURVE_LAUNCH_OFFSET);
+        let bulge = max_side_offset(CURVE_ACCEL / PREV_CURVE_ACCEL, MAX_THROW_SPEED * CURVE_SPEED, CURVE_LAUNCH_OFFSET);
         assert!(bulge < 3.0, "bulge {bulge}");
     }
 
@@ -469,11 +511,14 @@ mod tests {
     fn lob_is_faster_and_arcs_higher() {
         let (v, _) = launch(Vec3::NEG_Z, throw(0.0, 0.0, true));
         let fwd = Vec3::new(v.x, 0.0, v.z).length();
-        assert!((fwd / PREV_LOB_FORWARD - 1.3).abs() < 1e-3, "forward x1.3");
-        let height_ratio = (v.y * v.y) / (PREV_LOB_UP * PREV_LOB_UP);
+        assert!((fwd / PREV_LOB_FORWARD - 1.3 * 1.4).abs() < 1e-3, "forward x1.3 x1.4");
+        assert!((v.y / (PREV_LOB_UP * 1.183_216) - 1.4).abs() < 1e-3, "leaves the hand 40% faster");
+        // Same arc height as round 4 (x1.4 over round 3), flown in 1/1.4 of the time.
+        let height = v.y * v.y / (2.0 * LOB_GRAVITY);
+        let height_ratio = height / (PREV_LOB_UP * PREV_LOB_UP / (2.0 * FULL_GRAVITY));
         assert!((height_ratio - 1.4).abs() < 0.01, "arc height x1.4: {height_ratio}");
         // Peak stays under the 8 m walls when thrown from hand height.
-        let peak = 1.3 + v.y * v.y / (2.0 * FULL_GRAVITY);
+        let peak = 1.3 + height;
         assert!(peak < super::super::layout::WALL_HEIGHT, "peak {peak}");
     }
 
@@ -486,7 +531,7 @@ mod tests {
             let mut vel = lob_to(from, head);
             let mut closest = f32::MAX;
             for _ in 0..300 {
-                step(&mut pos, &mut vel, 0.0, FULL_GRAVITY, 1.0 / 120.0, &[]);
+                step(&mut pos, &mut vel, 0.0, LOB_GRAVITY, 1.0 / 120.0, &[]);
                 closest = closest.min(pos.distance(head));
                 if vel.y < 0.0 && pos.y < head.y - 0.5 {
                     break;
@@ -494,6 +539,43 @@ mod tests {
             }
             assert!(closest < 0.4, "{dist} m lob missed the head by {closest}");
         }
+    }
+
+    #[test]
+    fn guided_lob_follows_a_runner_onto_the_head() {
+        let from = Vec3::new(0.0, 1.3, 0.0);
+        let mut head = Vec3::new(0.0, 1.9, -12.0);
+        let (mut pos, mut vel) = (from, lob_to(from, head));
+        let dt = 1.0 / 120.0;
+        let mut closest = f32::MAX;
+        for _ in 0..400 {
+            head.x += 10.0 * dt; // sprinting sideways
+            guide_lob(&mut vel, pos, head, LOB_GRAVITY);
+            step(&mut pos, &mut vel, 0.0, LOB_GRAVITY, dt, &[]);
+            closest = closest.min(pos.distance(head));
+            if vel.y < 0.0 && pos.y < head.y - 0.5 {
+                break;
+            }
+        }
+        assert!(closest < 0.4, "missed the runner's head by {closest}");
+    }
+
+    #[test]
+    fn guidance_closes_any_angle_before_arrival() {
+        // Ball flying 45 degrees off; target 10 m away at 40 m/s.
+        let mut pos = Vec3::ZERO;
+        let mut vel = Vec3::new(1.0, 0.0, -1.0).normalize() * 40.0;
+        let target = Vec3::new(0.0, 0.0, -10.0);
+        let dt = 1.0 / 60.0;
+        let mut closest = f32::MAX;
+        for _ in 0..60 {
+            let to = target - pos;
+            let eta = to.length() / vel.length();
+            guide_to(&mut vel, to, eta, dt);
+            pos += vel * dt;
+            closest = closest.min(pos.distance(target));
+        }
+        assert!(closest < BALL_RADIUS + 0.45, "closest {closest}");
     }
 
     #[test]
