@@ -95,6 +95,28 @@
   - Perfect catch (and a returning boomerang): the ball is already fully charged, so a single
     click throws it at full power immediately. The next ball picked up charges normally.
 
+- **Milestone 2 - parkour (playable).** 132 game tests + 23 ranked, clippy clean. Verified in
+  the real app with the `--drill` autopilot: offline and as a LAN client (7 full laps, no
+  errors): wall run, wall jump, wall-to-wall, climb, ledge hang, throw while hanging, shimmy,
+  climb up on top.
+  - Every character, no mount. Logic in `parkour.rs` (pure, unit-tested on the real arena).
+  - Wall run: jump next to a tall wall while moving along it: run along it up to 1.3 s with
+    low gravity. Space = wall jump (up and away, keeps some speed; air jumps refilled).
+    Each wall once per landing.
+  - Wall-to-wall: wall jump across to another wall and keep moving along it to wall run again.
+  - Wall climb: jump into a wall too tall to vault: run up it for 0.5 s.
+  - Ledge hang: in the air near a ledge at hand height (falling, or at the top of a climb):
+    hang. A/D shimmy (stops at the ends), Space climb up onto the top, S+Space jump off
+    backward, Ctrl let go. Throw and catch still work (the body turns to aim one-handed).
+  - Vault / wall mount: in the air pushing into a ledge up to chest height (low wall, small
+    blocks): pull straight up onto it.
+  - Arena: a 5.5 m parkour panel on each flank, 4.2 m from the side wall (corridor for
+    wall-to-wall jumps). Pillars and blocks can be climbed and hung from too.
+  - Animations: lean off the wall while wall running, hand-over-hand climb, two-hand hang
+    (one hand while throwing), pull-up over the ledge. Other players see them (protocol 5).
+  - HUD hints while hanging / wall running; controls line added.
+  - Being slimed, bricked, launched or dashing ends any parkour move.
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`
@@ -103,10 +125,12 @@
   Enter back to warm-up.
 - Esc frees the mouse; click to capture it again.
 - Testing aids: `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts),
+  `--drill` (autopilot loops the parkour drill on the +X flank),
   `--bind 127.0.0.1` (host on loopback only, no firewall prompt).
 
 ## In progress
-Nothing. Milestone 1 waiting for a human play-test of the feel (mouse aim, throw/catch timing).
+Nothing. Milestone 2 waiting for a human play-test of the feel (wall run speed/length, grab
+heights, climb-up timing).
 
 ## Known bugs / limits
 - Movement is client-authoritative (fine for LAN with friends, not cheat-proof).
@@ -115,6 +139,10 @@ Nothing. Milestone 1 waiting for a human play-test of the feel (mouse aim, throw
 - The kill feed may miss an event if a UDP packet is lost (scores/state are unaffected).
 - First LAN host run triggers a Windows Firewall prompt; allow it or peers can't join.
 - No sound, no player name tags yet.
+- Bots don't do parkour yet (they still play the ball game normally around the panels).
+- Parkour uses the arena's box list, so it only works on axis-aligned boxes (all current
+  geometry); corners can't be wall run around.
 
 ## Next step
-Milestone 2: parkour (wallrun, wall mount, wall-to-wall jump, ledge hang, throw while hanging).
+Milestone 3: mounts (skateboard, BMX, inline skates, longboard, scooter, soap shoes) with
+tricks defined in RON data files.

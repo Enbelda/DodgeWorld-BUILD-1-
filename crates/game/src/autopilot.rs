@@ -2,16 +2,36 @@
 //! camera yaw, queued actions) so the real app can be play-tested without a human.
 //! It cycles through straight, curved and lobbed throws, goes for perfect catches, sprints,
 //! dashes now and then, and every few seconds does a double-jump flip or an air spin.
+//!
+//! With `--drill` it instead loops a parkour drill on the +X flank: wall run along the outer
+//! wall, wall jump across to the panel and wall run on it, then climb the panel, hang from
+//! its ledge (throwing from there if holding a ball), shimmy, climb up on top and drop off.
 
 use bevy::prelude::*;
 
 use crate::camera::FollowCamera;
-use crate::player::{Autopilot, LocalBody, LockOn, MoveIntent, Side, FEET_OFFSET};
+use crate::parkour;
+use crate::player::{Autopilot, LocalBody, LocalParkour, LockOn, MoveIntent, Side, FEET_OFFSET};
 use crate::session::{LocalActions, View};
 use crate::sim::{bot::yaw_toward, Action, BallState, HOLD_HEIGHT};
 
 const THROW_EVERY: f32 = 1.4;
 const PREFERRED_RANGE: f32 = 12.0;
+
+/// `--drill`: the autopilot runs the parkour drill.
+#[derive(Resource, Default)]
+pub struct ParkourDrill(pub bool);
+
+/// Where the parkour drill is.
+#[derive(Default)]
+pub struct DrillState {
+    step: u32,
+    /// Seconds in the current step.
+    t: f32,
+    laps: u32,
+    /// The jump for this step was already pressed (a key press lasts one frame).
+    jumped: bool,
+}
 
 #[derive(Default)]
 pub struct AutoState {
@@ -40,6 +60,9 @@ pub fn drive(
     mut actions: ResMut<LocalActions>,
     mut lock: ResMut<LockOn>,
     mut st: Local<AutoState>,
+    drill_on: Res<ParkourDrill>,
+    pk: Res<LocalParkour>,
+    mut ds: Local<DrillState>,
 ) {
     if !auto.0 {
         return;
@@ -48,9 +71,20 @@ pub fn drive(
     *intent = MoveIntent::default();
     let (Some(snap), Some(me)) = (view.snap.as_ref(), view.me()) else { return };
     if !me.alive() {
+        ds.step = 0;
         return;
     }
     let feet = body.translation - Vec3::Y * FEET_OFFSET;
+    if drill_on.0 {
+        let enemy = snap
+            .players
+            .iter()
+            .filter(|p| p.team != me.team && p.alive())
+            .map(|p| Vec3::from_array(p.pos))
+            .min_by(|a, b| a.distance(feet).total_cmp(&b.distance(feet)));
+        drill(&mut ds, dt, feet, me.holding, enemy, &pk.0, &mut cam, &mut intent, &mut actions);
+        return;
+    }
 
     let enemy = snap
         .players
@@ -191,5 +225,162 @@ pub fn drive(
         }
     } else if incoming.is_none() && intent.dir != Vec3::ZERO {
         cam.yaw = yaw_toward(intent.dir);
+    }
+}
+
+/// Walk toward `goal` (flat); true once there.
+fn walk_to(feet: Vec3, goal: Vec3, cam: &mut FollowCamera, intent: &mut MoveIntent) -> bool {
+    let d = Vec3::new(goal.x - feet.x, 0.0, goal.z - feet.z);
+    if d.length() < 0.4 {
+        return true;
+    }
+    intent.dir = d.normalize();
+    cam.yaw = yaw_toward(d);
+    false
+}
+
+/// One frame of the parkour drill. Steps:
+/// 0 go to the corridor, 1-2 jump and wall run along the outer wall, 3 wall jump across and
+/// wall run on the panel, 4-6 walk round to the panel's open face (over the slime pad, to
+/// pick up a ball), 7 jump and climb into a hang, 8 throw from the hang, 9 shimmy,
+/// 10 climb up on top, 11 walk off.
+#[allow(clippy::too_many_arguments)]
+fn drill(
+    ds: &mut DrillState,
+    dt: f32,
+    feet: Vec3,
+    holding: bool,
+    enemy: Option<Vec3>,
+    pk: &parkour::Parkour,
+    cam: &mut FollowCamera,
+    intent: &mut MoveIntent,
+    actions: &mut LocalActions,
+) {
+    const CORRIDOR: Vec3 = Vec3::new(19.0, 0.0, 10.0);
+    let along_outer = Vec3::new(0.25, 0.0, -1.0).normalize();
+    let to_panel = Vec3::new(-0.25, 0.0, -1.0).normalize();
+    let path = [Vec3::new(17.5, 0.0, -6.0), Vec3::new(13.0, 0.0, -6.0), Vec3::new(13.0, 0.0, -0.8)];
+    let face = Vec3::new(14.5, 0.0, -0.5);
+    ds.t += dt;
+    let pose = pk.pose();
+    let next = |ds: &mut DrillState, why: &str| {
+        info!("autopilot drill: step {} done ({why})", ds.step);
+        ds.step += 1;
+        ds.t = 0.0;
+        ds.jumped = false;
+    };
+    let fail = |ds: &mut DrillState, why: &str| {
+        info!("autopilot drill: step {} failed ({why}), starting over", ds.step);
+        ds.step = 0;
+        ds.t = 0.0;
+        ds.jumped = false;
+    };
+    match ds.step {
+        0 => {
+            if walk_to(feet, CORRIDOR, cam, intent) && feet.y < 0.1 {
+                next(ds, "in the corridor");
+            } else if ds.t > 20.0 {
+                fail(ds, "could not reach the corridor");
+            }
+        }
+        1 => {
+            cam.yaw = yaw_toward(Vec3::NEG_Z);
+            intent.dir = along_outer;
+            intent.jump = true;
+            next(ds, "jumped");
+        }
+        2 => {
+            cam.yaw = yaw_toward(Vec3::NEG_Z);
+            intent.dir = along_outer;
+            let running = matches!(pose, crate::sim::ParkourPose::WallRunLeft | crate::sim::ParkourPose::WallRunRight);
+            if running && ds.t > 0.45 {
+                intent.jump = true; // wall jump toward the panel
+                next(ds, "wall ran on the outer wall, wall jump");
+            } else if ds.t > 1.5 {
+                fail(ds, "no wall run");
+            }
+        }
+        3 => {
+            cam.yaw = yaw_toward(Vec3::NEG_Z);
+            intent.dir = to_panel;
+            if matches!(pk.state, parkour::State::WallRun { normal, .. } if normal == Vec3::X) {
+                info!("autopilot drill: wall-to-wall: running on the panel");
+            }
+            if ds.t > 1.2 && feet.y < 0.1 {
+                next(ds, "landed");
+            } else if ds.t > 4.0 {
+                fail(ds, "never landed");
+            }
+        }
+        4..=6 => {
+            if walk_to(feet, path[(ds.step - 4) as usize], cam, intent) {
+                next(ds, "waypoint");
+            } else if ds.t > 12.0 {
+                fail(ds, "stuck on the way to the panel");
+            }
+        }
+        7 => {
+            if ds.t < 0.6 {
+                walk_to(feet, face, cam, intent);
+                return;
+            }
+            cam.yaw = yaw_toward(Vec3::X);
+            intent.dir = Vec3::X;
+            intent.jump = !ds.jumped;
+            ds.jumped = true;
+            if pose == crate::sim::ParkourPose::Hang {
+                next(ds, "climbed into a ledge hang");
+            } else if ds.t > 3.0 {
+                fail(ds, "no hang");
+            }
+        }
+        8 => {
+            cam.yaw = yaw_toward(Vec3::X);
+            if pose != crate::sim::ParkourPose::Hang {
+                fail(ds, "fell off");
+            } else if ds.t > 0.6 {
+                if let (true, Some(e)) = (holding, enemy) {
+                    let hold = feet + Vec3::Y * HOLD_HEIGHT;
+                    let aim = (e + Vec3::Y * 1.0 - hold).normalize_or(Vec3::NEG_X).to_array();
+                    cam.yaw = yaw_toward(Vec3::new(e.x - feet.x, 0.0, e.z - feet.z));
+                    intent.face_camera = true;
+                    actions.0.push(Action::Throw { aim, charge: 1.0, curve: 0.0, lob: false });
+                    info!("autopilot: threw while hanging");
+                }
+                next(ds, "hung on");
+            }
+        }
+        9 => {
+            cam.yaw = yaw_toward(Vec3::X);
+            intent.dir = Vec3::NEG_Z; // shimmy (along the ledge)
+            if ds.t > 0.6 {
+                next(ds, "shimmied");
+            }
+        }
+        10 => {
+            cam.yaw = yaw_toward(Vec3::X);
+            // One press to climb up, then stand still on the narrow top.
+            intent.dir = if ds.jumped { Vec3::ZERO } else { Vec3::X };
+            intent.jump = !ds.jumped;
+            ds.jumped = true;
+            if ds.t > 0.8 {
+                if feet.y > 5.0 {
+                    info!("autopilot: on top of the panel (y {:.2})", feet.y);
+                    next(ds, "climbed up");
+                } else {
+                    fail(ds, "did not climb up");
+                }
+            }
+        }
+        _ => {
+            cam.yaw = yaw_toward(Vec3::NEG_X);
+            intent.dir = Vec3::NEG_X;
+            if ds.t > 1.5 {
+                ds.laps += 1;
+                info!("autopilot drill: lap {} complete", ds.laps);
+                ds.step = 0;
+                ds.t = 0.0;
+            }
+        }
     }
 }

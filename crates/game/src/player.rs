@@ -4,6 +4,8 @@
 //! double jump with a flip), hold Left Mouse to charge (locks the nearest enemy while charging)
 //! and release to throw, hold Q / E while throwing to curve, F to lob, Right Mouse to catch
 //! (time it), Tab / Middle Mouse while charging to switch target.
+//! Parkour (see `parkour.rs`): run along a tall wall in the air to wall run, push into it to
+//! climb, grab ledges at hand height, Space to climb up / jump off, Ctrl to let go.
 //! In the air: Q / E spin the body 180 left / right (the camera stays put); W+Q/E front flip,
 //! S+Q/E back flip. After a perfect catch (or a returning boomerang) the ball is already
 //! fully charged: a click throws it at once.
@@ -12,6 +14,7 @@ use bevy::prelude::*;
 use bevy_rapier3d::prelude::*;
 
 use crate::camera::{CursorLocked, FollowCamera};
+use crate::parkour::{self, Drive, Parkour};
 use crate::session::{LocalActions, LocalTrick, View};
 use crate::sim::bot::yaw_toward;
 use crate::sim::{
@@ -55,7 +58,13 @@ pub struct LocalBody {
     pub sprint_jump: bool,
     /// Last host teleport counter we obeyed.
     pub teleports: Option<u32>,
+    /// Horizontal momentum from wall jumps.
+    pub push: Vec3,
 }
+
+/// The local player's parkour state.
+#[derive(Resource, Default)]
+pub struct LocalParkour(pub Parkour);
 
 /// Throw charge in progress, for the HUD.
 #[derive(Resource, Default)]
@@ -187,6 +196,7 @@ impl Plugin for PlayerPlugin {
             .init_resource::<LockOn>()
             .init_resource::<LocalDash>()
             .init_resource::<LocalFacing>()
+            .init_resource::<LocalParkour>()
             .add_systems(Startup, spawn_local_body)
             .add_systems(
                 Update,
@@ -327,13 +337,15 @@ fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
 }
 
 /// Snap to the host's position whenever it respawns us.
-fn obey_teleports(view: Res<View>, body: Single<(&mut LocalBody, &mut Transform)>) {
+fn obey_teleports(view: Res<View>, mut parkour: ResMut<LocalParkour>, body: Single<(&mut LocalBody, &mut Transform)>) {
     let Some(me) = view.me() else { return };
     let (mut b, mut tf) = body.into_inner();
     if b.teleports != Some(me.teleports) {
         b.teleports = Some(me.teleports);
         tf.translation = Vec3::from_array(me.pos) + Vec3::Y * FEET_OFFSET;
         b.vel_y = 0.0;
+        b.push = Vec3::ZERO;
+        parkour.0.reset();
     }
 }
 
@@ -430,6 +442,8 @@ pub fn move_local_body(
     mut trick: ResMut<LocalTrick>,
     mut dash: ResMut<LocalDash>,
     mut facing: ResMut<LocalFacing>,
+    mut parkour: ResMut<LocalParkour>,
+    mut solids: Local<Vec<layout::Aabb>>,
     cam: Single<&FollowCamera>,
     body: Single<(
         &mut LocalBody,
@@ -443,16 +457,25 @@ pub fn move_local_body(
     let me = view.me();
     tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
     dash.tick(dt);
+    if solids.is_empty() {
+        *solids = layout::solids();
+    }
     if !me.is_none_or(|m| m.alive()) {
         controller.translation = None;
         trick.0 = None;
         dash.active = 0.0;
+        parkour.0.reset();
         return;
     }
     // Slimed, knocked flat or launched: the host owns our position.
     if let Some(m) = me.filter(|m| m.slimed > 0.0 || m.stunned > 0.0 || m.knocked) {
         trick.0 = None;
         dash.active = 0.0;
+        if !parkour.0.is_free() {
+            info!("parkour: knocked off the wall");
+        }
+        parkour.0.reset();
+        b.push = Vec3::ZERO;
         let target = Vec3::from_array(m.pos) + Vec3::Y * FEET_OFFSET;
         tf.translation = tf.translation.lerp(target, 1.0 - (-20.0 * dt).exp());
         controller.translation = None;
@@ -467,11 +490,15 @@ pub fn move_local_body(
         b.sprint_jump = false;
     }
     // Ctrl: a quick burst in the movement direction (or straight ahead), ground or air.
-    if intent.dash {
+    // (While hanging from a ledge Ctrl lets go instead.)
+    let hanging = matches!(parkour.0.state, parkour::State::Hang { .. } | parkour::State::Mantle { .. });
+    if intent.dash && !hanging {
         let fwd = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
         let dir = if intent.dir.length_squared() > 0.01 { intent.dir } else { fwd };
         if dash.try_start(dir, intent.sprint) {
             trick.0 = None;
+            parkour.0.reset();
+            b.push = Vec3::ZERO;
         }
     }
     if dash.dashing() {
@@ -481,7 +508,42 @@ pub fn move_local_body(
     }
     let forward = Vec3::new(-cam.yaw.sin(), 0.0, -cam.yaw.cos());
     let fwd_amount = intent.dir.normalize_or_zero().dot(forward);
-    if intent.jump {
+
+    // Parkour: wall run, climb, hang, vault / climb up.
+    let feet = tf.translation - Vec3::Y * FEET_OFFSET;
+    let mut motion = parkour::Motion { vel_y: b.vel_y, push: b.push, air_jumps: b.air_jumps };
+    let input = parkour::Input {
+        dir: intent.dir.normalize_or_zero(),
+        forward,
+        jump: intent.jump,
+        drop: intent.dash,
+        grounded,
+    };
+    let out = parkour.0.update(&mut motion, &input, feet, dt, &solids);
+    (b.vel_y, b.push, b.air_jumps) = (motion.vel_y, motion.push, motion.air_jumps);
+    if let Some(e) = out.event {
+        info!("parkour: {e}");
+    }
+    // On a wall the body faces along it / into it, unless aiming (throw while hanging).
+    if let Some(face) = parkour.0.facing() {
+        trick.0 = None;
+        facing.0 = if intent.face_camera { 0.0 } else { yaw_toward(face) - cam.yaw };
+        tf.rotation = Quat::from_rotation_y(facing.body_yaw(cam.yaw));
+    }
+    match out.drive {
+        Drive::Translate(d) => {
+            controller.translation = Some(d);
+            return;
+        }
+        Drive::Place(p) => {
+            tf.translation = p + Vec3::Y * FEET_OFFSET;
+            controller.translation = None;
+            return;
+        }
+        Drive::Normal => {}
+    }
+
+    if intent.jump && !out.used_jump {
         if let Some((vy, left)) = try_jump(grounded, b.air_jumps) {
             b.vel_y = vy;
             b.air_jumps = left;
@@ -507,7 +569,9 @@ pub fn move_local_body(
 
     b.vel_y -= GRAVITY * dt;
     let speed = MOVE_SPEED * move_multiplier(intent.sprint, !grounded && b.sprint_jump);
-    let flat = intent.dir.normalize_or_zero() * speed;
+    // Wall-jump momentum carries you across, fading in the air.
+    let flat = intent.dir.normalize_or_zero() * speed + b.push;
+    b.push = if grounded { Vec3::ZERO } else { b.push * (-parkour::PUSH_DECAY * dt).exp() };
     controller.translation = Some(Vec3::new(flat.x, b.vel_y, flat.z) * dt);
 }
 

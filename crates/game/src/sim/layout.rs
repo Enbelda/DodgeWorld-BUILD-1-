@@ -57,6 +57,9 @@ pub fn cover() -> Vec<Aabb> {
         v.push(Aabb::from_center(Vec3::new(0.0, 0.6, 7.0 * s), Vec3::new(3.0, 0.6, 0.4)));
         v.push(Aabb::from_center(Vec3::new(9.0 * s, 1.5, 0.0), Vec3::new(1.0, 1.5, 1.0)));
         v.push(Aabb::from_center(Vec3::new(-9.0 * s, 1.0, 12.0 * s), Vec3::new(1.5, 1.0, 1.5)));
+        // Parkour panel on each flank: 5.5 m tall, 8 m long, 4.2 m from the side wall, so
+        // players can wall run, climb, hang from its top and jump wall to wall.
+        v.push(Aabb::from_center(Vec3::new(15.5 * s, 2.75, 0.0), Vec3::new(0.3, 2.75, 4.0)));
     }
     v
 }
@@ -116,9 +119,19 @@ mod tests {
     fn anchor_is_on_closest_wall() {
         let walls = solids();
         // Near the +X boundary wall in an open spot.
-        let a = nearest_wall_anchor(Vec3::new(17.0, 0.0, 5.0), &walls, 0.45);
+        let a = nearest_wall_anchor(Vec3::new(17.0, 0.0, 10.0), &walls, 0.45);
         assert!((a.x - (ARENA_HALF - 0.45)).abs() < 1e-4, "{a}");
-        assert_eq!(a.z, 5.0);
+        assert_eq!(a.z, 10.0);
+    }
+
+    #[test]
+    fn parkour_panels_leave_a_corridor_by_the_side_walls() {
+        let panels: Vec<Aabb> = cover().into_iter().filter(|c| c.max.y > 4.0).collect();
+        assert_eq!(panels.len(), 2);
+        for p in panels {
+            let gap = ARENA_HALF - p.max.x.abs().max(p.min.x.abs());
+            assert!((4.0..4.5).contains(&gap), "corridor {gap}");
+        }
     }
 
     #[test]

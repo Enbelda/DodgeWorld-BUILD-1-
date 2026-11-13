@@ -137,11 +137,13 @@ fn sync_avatars(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_local_body(
     view: Res<View>,
     charge: Res<crate::player::Charge>,
     trick: Res<crate::session::LocalTrick>,
     dash: Res<crate::player::LocalDash>,
+    parkour: Res<crate::player::LocalParkour>,
     time: Res<Time>,
     mut rig_input: ResMut<crate::rig::LocalRigInput>,
     body: Single<&mut Visibility, With<LocalBody>>,
@@ -149,6 +151,7 @@ fn sync_local_body(
     rig_input.charge = charge.amount(time.elapsed_secs());
     rig_input.trick = trick.0;
     rig_input.dashing = dash.dashing();
+    rig_input.parkour = parkour.0.pose();
     let Some(me) = view.me() else { return };
     *body.into_inner() = if me.alive() { Visibility::Inherited } else { Visibility::Hidden };
 }

@@ -120,6 +120,20 @@ pub struct TrickState {
     pub progress: f32,
 }
 
+/// What a player is doing on a wall, reported by the client so others can see it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum ParkourPose {
+    #[default]
+    None,
+    /// Running along a wall on the player's left / right.
+    WallRunLeft,
+    WallRunRight,
+    Climb,
+    Hang,
+    /// Pulling up onto a ledge.
+    Mantle,
+}
+
 /// A slimed player is dragged to `anchor` on the nearest wall and held there.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Slime {
@@ -158,6 +172,7 @@ pub struct Player {
     /// > 0 while knocked flat by a brick: no moving, throwing or catching.
     pub stun: f32,
     pub trick: Option<TrickState>,
+    pub parkour: ParkourPose,
     /// Bumped on every hit taken, so clients can flash the model.
     pub hits: u32,
     /// > 0 while knocked out.
@@ -338,6 +353,7 @@ impl Match {
             tackled: Vec::new(),
             stun: 0.0,
             trick: None,
+            parkour: ParkourPose::None,
             hits: 0,
             respawn_timer: 0.0,
             teleports: 0,
@@ -400,6 +416,13 @@ impl Match {
                 kind: t.kind,
                 progress: t.progress.clamp(0.0, 1.0),
             });
+        }
+    }
+
+    /// A client reports what it is doing on a wall.
+    pub fn set_parkour(&mut self, id: PlayerId, pose: ParkourPose) {
+        if let Some(p) = self.player_mut(id) {
+            p.parkour = pose;
         }
     }
 
@@ -1077,6 +1100,7 @@ impl Match {
                     knocked: p.knock.is_some(),
                     dashing: p.dashing,
                     trick: p.trick,
+                    parkour: if p.alive() && !p.helpless() { p.parkour } else { ParkourPose::None },
                     hits: p.hits,
                     catch_cooldown: p.catch_cooldown,
                     respawn_timer: p.respawn_timer.max(0.0),
@@ -1152,6 +1176,7 @@ pub struct PlayerView {
     /// Mid-dash: invincible, shown glowing blue.
     pub dashing: bool,
     pub trick: Option<TrickState>,
+    pub parkour: ParkourPose,
     pub hits: u32,
     pub respawn_timer: f32,
     pub teleports: u32,
@@ -1738,7 +1763,7 @@ mod tests {
     fn knocked_player_flies_then_lands() {
         let (mut m, red, _) = duel();
         let i = m.players.iter().position(|p| p.id == red).unwrap();
-        m.launch(i, Vec3::new(5.0, 6.0, 0.0));
+        m.launch(i, Vec3::new(-5.0, 6.0, 0.0));
         let start = m.player(red).unwrap().pos;
         assert!(m.player(red).unwrap().holding.is_none(), "dropped the ball");
         run(&mut m, 0.2);
@@ -1746,7 +1771,7 @@ mod tests {
         run(&mut m, 1.5);
         let r = m.player(red).unwrap();
         assert!(r.knock.is_none() && r.pos.y == 0.0);
-        assert!(r.pos.x > start.x + 2.0, "pushed along");
+        assert!(r.pos.x < start.x - 2.0, "pushed along");
     }
 
     #[test]

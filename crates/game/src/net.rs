@@ -9,9 +9,9 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use bevy::math::Vec3;
 use serde::{Deserialize, Serialize};
 
-use crate::sim::{Action, Match, PlayerId, Snapshot, TrickState};
+use crate::sim::{Action, Match, ParkourPose, PlayerId, Snapshot, TrickState};
 
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 pub const DEFAULT_PORT: u16 = 47800;
 /// A peer that sends nothing for this long is dropped.
 pub const TIMEOUT_SECS: f64 = 5.0;
@@ -20,7 +20,14 @@ const MAX_PACKET: usize = 8 * 1024;
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum ToHost {
     Join { protocol: u32, name: String },
-    Update { pos: [f32; 3], yaw: f32, trick: Option<TrickState>, dash: Option<u32>, actions: Vec<(u32, Action)> },
+    Update {
+        pos: [f32; 3],
+        yaw: f32,
+        trick: Option<TrickState>,
+        dash: Option<u32>,
+        parkour: ParkourPose,
+        actions: Vec<(u32, Action)>,
+    },
     Leave,
 }
 
@@ -114,11 +121,12 @@ impl HostNet {
                     None => send(&self.sock, from, &ToClient::Rejected { reason: "lobby is full".into() }),
                 }
             }
-            ToHost::Update { pos, yaw, trick, dash, actions } => {
+            ToHost::Update { pos, yaw, trick, dash, parkour, actions } => {
                 let Some(peer) = self.peers.get_mut(&from) else { return };
                 peer.last_seen = now;
                 m.set_pose(peer.id, Vec3::from_array(pos), yaw);
                 m.set_trick(peer.id, trick);
+                m.set_parkour(peer.id, parkour);
                 m.set_dash(peer.id, dash);
                 let mut sorted = actions;
                 sorted.sort_by_key(|(seq, _)| *seq);
@@ -248,7 +256,16 @@ impl ClientNet {
     }
 
     /// Send our pose (and pending actions), or keep knocking while connecting.
-    pub fn send_update(&mut self, pos: Vec3, yaw: f32, trick: Option<TrickState>, dash: Option<u32>, now: f64) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_update(
+        &mut self,
+        pos: Vec3,
+        yaw: f32,
+        trick: Option<TrickState>,
+        dash: Option<u32>,
+        parkour: ParkourPose,
+        now: f64,
+    ) {
         match self.status {
             ClientStatus::Connecting => {
                 if now - self.last_join > 0.5 {
@@ -261,7 +278,7 @@ impl ClientNet {
                 }
             }
             ClientStatus::Connected(_) => {
-                let msg = ToHost::Update { pos: pos.to_array(), yaw, trick, dash, actions: self.pending.clone() };
+                let msg = ToHost::Update { pos: pos.to_array(), yaw, trick, dash, parkour, actions: self.pending.clone() };
                 send(&self.sock, self.host, &msg);
             }
             _ => {}
@@ -281,7 +298,8 @@ mod tests {
     fn pump(host: &mut HostNet, m: &mut Match, c: &mut ClientNet, now: &mut f64, pos: Vec3) {
         for _ in 0..50 {
             *now += 0.02;
-            c.send_update(pos, 0.0, Some(TrickState { kind: crate::sim::TrickKind::FrontFlip, progress: 0.5 }), None, *now);
+            let trick = Some(TrickState { kind: crate::sim::TrickKind::FrontFlip, progress: 0.5 });
+            c.send_update(pos, 0.0, trick, None, ParkourPose::Hang, *now);
             std::thread::sleep(std::time::Duration::from_millis(2));
             host.receive(m, *now);
             m.step(0.02);
@@ -312,6 +330,7 @@ mod tests {
         let me = snap.players.iter().find(|p| p.id == id).unwrap();
         assert_eq!(me.name, "guest");
         assert!(me.trick.is_some(), "trick travels with the pose");
+        assert_eq!(me.parkour, ParkourPose::Hang, "and so does parkour");
         assert_eq!(me.pos, [3.0, 0.0, -12.0], "host uses the client's pose");
     }
 

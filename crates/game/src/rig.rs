@@ -6,14 +6,15 @@
 //!
 //! Posed every frame from the player's state: walk/run cycle with a forward lean and
 //! breathing, gripping the held ball, winding up and swinging through a throw, open hands
-//! reaching out to catch, knocked flat, slimed spread-eagle, tucked flips, and a white
-//! flash when hit.
+//! reaching out to catch, knocked flat, slimed spread-eagle, tucked flips, parkour (leaning
+//! off a wall while wall running, hand-over-hand climbing, hanging by both hands or one hand
+//! while throwing, pulling up over a ledge), and a white flash when hit.
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use bevy::prelude::*;
 
-use crate::sim::{PlayerId, PlayerView, Team, TrickKind, TrickState};
+use crate::sim::{ParkourPose, PlayerId, PlayerView, Team, TrickKind, TrickState};
 
 /// Height of the hip/flip pivot above the feet. Flips rotate the body around it.
 const PIVOT: f32 = 0.9;
@@ -91,6 +92,7 @@ pub struct LocalRigInput {
     pub charge: Option<f32>,
     pub trick: Option<TrickState>,
     pub dashing: bool,
+    pub parkour: ParkourPose,
 }
 
 #[derive(Resource)]
@@ -325,6 +327,7 @@ pub struct PoseInput {
     pub trick: Option<TrickState>,
     /// Seconds since start, for breathing.
     pub time: f32,
+    pub parkour: ParkourPose,
 }
 
 /// Joint angles: (pitch about X, roll about Z). Positive shoulder pitch raises the arm forward;
@@ -337,6 +340,8 @@ pub struct Pose {
     pub body_pitch: f32,
     /// How far the pivot drops (lying on the floor).
     pub drop: f32,
+    /// Sideways lean of the whole body about Z (wall running).
+    pub body_roll: f32,
     /// How closed each hand is: 0 open and spread, 1 a fist. [left, right].
     pub grip: [f32; 2],
 }
@@ -417,6 +422,73 @@ pub fn pose(i: &PoseInput) -> Pose {
         j[R_KNEE] = (0.0, 0.0);
         j[SPINE] = (0.05, 0.0);
         p.grip = [0.0, 0.0];
+    }
+
+    // The right arm is busy if it holds a ball (charging / throwing works while hanging).
+    let right_busy = i.holding || i.throw_t < THROW_SECS;
+    match i.parkour {
+        ParkourPose::WallRunLeft | ParkourPose::WallRunRight => {
+            // Feet on the wall, body leaning away from it, wall-side arm out for balance.
+            let left = i.parkour == ParkourPose::WallRunLeft;
+            p.body_roll = if left { -0.45 } else { 0.45 };
+            if left {
+                j[L_SHOULDER] = (0.4, -1.0);
+                j[L_ELBOW] = (0.3, 0.0);
+            } else if !right_busy {
+                j[R_SHOULDER] = (0.4, 1.0);
+                j[R_ELBOW] = (0.3, 0.0);
+            }
+        }
+        ParkourPose::Climb => {
+            // Hand over hand, knees driving up.
+            let c = (i.time * 12.0).sin();
+            j[L_SHOULDER] = (2.6 + 0.4 * c, -0.15);
+            j[L_ELBOW] = (0.5 - 0.3 * c, 0.0);
+            if !right_busy {
+                j[R_SHOULDER] = (2.6 - 0.4 * c, 0.15);
+                j[R_ELBOW] = (0.5 + 0.3 * c, 0.0);
+                p.grip[1] = 0.7;
+            }
+            j[L_HIP] = (0.9 + 0.4 * c, 0.0);
+            j[R_HIP] = (0.9 - 0.4 * c, 0.0);
+            j[L_KNEE] = (-1.3, 0.0);
+            j[R_KNEE] = (-1.3, 0.0);
+            j[SPINE] = (-0.1, 0.0);
+            p.grip[0] = 0.7;
+        }
+        ParkourPose::Hang => {
+            // Arms straight up gripping the ledge; legs dangling a little forward.
+            j[L_SHOULDER] = (2.95, -0.25);
+            j[L_ELBOW] = (0.15, 0.0);
+            p.grip[0] = 0.9;
+            if !right_busy {
+                j[R_SHOULDER] = (2.95, 0.25);
+                j[R_ELBOW] = (0.15, 0.0);
+                p.grip[1] = 0.9;
+            }
+            j[L_HIP] = (0.2, -0.05);
+            j[R_HIP] = (0.1, 0.05);
+            j[L_KNEE] = (-0.3, 0.0);
+            j[R_KNEE] = (-0.2, 0.0);
+            j[L_ANKLE] = (-0.4, 0.0);
+            j[R_ANKLE] = (-0.4, 0.0);
+            j[SPINE] = (0.05, 0.0);
+            j[NECK] = (0.25, 0.0);
+        }
+        ParkourPose::Mantle => {
+            // Pushing down on the ledge, one knee up onto it.
+            j[L_SHOULDER] = (0.5, -0.2);
+            j[R_SHOULDER] = (0.5, 0.2);
+            j[L_ELBOW] = (0.3, 0.0);
+            j[R_ELBOW] = (0.3, 0.0);
+            j[L_HIP] = (1.4, 0.0);
+            j[R_HIP] = (0.4, 0.0);
+            j[L_KNEE] = (-1.8, 0.0);
+            j[R_KNEE] = (-0.6, 0.0);
+            j[SPINE] = (-0.4, 0.0);
+            p.grip = [0.6, 0.6];
+        }
+        ParkourPose::None => {}
     }
 
     if let Some(t) = i.trick {
@@ -544,6 +616,7 @@ pub fn animate_rigs(
             stunned: pv.stunned > 0.0,
             slimed: pv.slimed > 0.0,
             trick: if is_local { local.trick } else { pv.trick },
+            parkour: if is_local { local.parkour } else { pv.parkour },
             // Offset per player so a team doesn't breathe in sync.
             time: time.elapsed_secs() + pv.id as f32 * 0.7,
         };
@@ -551,7 +624,7 @@ pub fn animate_rigs(
 
         if let Ok(mut tf) = transforms.get_mut(r.flip) {
             tf.translation.y = PIVOT - p.drop;
-            tf.rotation = Quat::from_rotation_x(p.body_pitch);
+            tf.rotation = Quat::from_rotation_z(p.body_roll) * Quat::from_rotation_x(p.body_pitch);
         }
         for (k, &(pitch, roll)) in p.joints.iter().enumerate() {
             if let Ok(mut tf) = transforms.get_mut(r.joints[k]) {
@@ -668,6 +741,24 @@ mod tests {
         });
         assert!((p.body_pitch - FRAC_PI_2).abs() < 1e-6, "stun overrides tricks");
         assert!(PIVOT - p.drop < 0.3);
+    }
+
+    #[test]
+    fn wall_run_leans_away_from_the_wall() {
+        let left = pose(&PoseInput { parkour: ParkourPose::WallRunLeft, ..idle() });
+        let right = pose(&PoseInput { parkour: ParkourPose::WallRunRight, ..idle() });
+        // Rolling about Z by a negative angle tips the head toward +X (right).
+        assert!(left.body_roll < -0.3 && right.body_roll > 0.3);
+    }
+
+    #[test]
+    fn hanging_arms_up_or_one_arm_throwing() {
+        let hang = pose(&PoseInput { parkour: ParkourPose::Hang, ..idle() });
+        assert!(hang.joints[L_SHOULDER].0 > 2.8 && hang.joints[R_SHOULDER].0 > 2.8, "both hands on the ledge");
+        assert!(hang.grip[0] > 0.8 && hang.grip[1] > 0.8);
+        let aiming = pose(&PoseInput { parkour: ParkourPose::Hang, holding: true, charge: Some(1.0), ..idle() });
+        assert!(aiming.joints[L_SHOULDER].0 > 2.8, "left hand still holds on");
+        assert!(aiming.joints[R_SHOULDER].0 < -2.0, "right arm winds up the throw");
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod camera;
 pub mod config;
 pub mod hud;
 pub mod net;
+pub mod parkour;
 pub mod player;
 pub mod render;
 pub mod rig;
@@ -30,6 +31,7 @@ pub fn run(cfg: LaunchConfig) -> Result<(), String> {
         .init_resource::<GlobalAmbientLight>()
         .insert_resource(session)
         .insert_resource(player::Autopilot(cfg.autopilot))
+        .insert_resource(autopilot::ParkourDrill(cfg.drill))
         .insert_resource(session::View { status, ..default() })
         .add_plugins((
             arena::ArenaPlugin,

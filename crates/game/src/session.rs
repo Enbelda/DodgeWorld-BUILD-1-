@@ -169,6 +169,7 @@ fn tick_session(
     trick: Res<LocalTrick>,
     dash: Res<crate::player::LocalDash>,
     facing: Res<crate::player::LocalFacing>,
+    parkour: Res<crate::player::LocalParkour>,
     body: Single<&Transform, With<LocalBody>>,
     cam: Single<&FollowCamera>,
 ) {
@@ -184,6 +185,7 @@ fn tick_session(
             host.sim.set_pose(local, feet, yaw);
             host.sim.set_trick(local, trick.0);
             host.sim.set_dash(local, dash.report());
+            host.sim.set_parkour(local, parkour.0.pose());
             for a in actions.0.drain(..) {
                 host.sim.apply(local, a);
             }
@@ -222,7 +224,7 @@ fn tick_session(
             for a in actions.0.drain(..) {
                 net.push_action(a);
             }
-            net.send_update(feet, yaw, trick.0, dash.report(), now);
+            net.send_update(feet, yaw, trick.0, dash.report(), parkour.0.pose(), now);
             if net.receive(now) {
                 if let Some(s) = net.latest.as_mut() {
                     new_events = std::mem::take(&mut s.events);

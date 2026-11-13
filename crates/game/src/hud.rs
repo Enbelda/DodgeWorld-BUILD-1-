@@ -9,7 +9,7 @@ use crate::player::{Charge, LocalDash, LockOn, MoveIntent, DASH_CHARGES, DASH_RE
 use crate::session::{SessionSet, View};
 use crate::sim::ball::BallKind;
 use crate::sim::{
-    BallState, GameMode, MapId, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
+    BallState, GameMode, MapId, ParkourPose, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
     PERFECT_SECS,
 };
 
@@ -88,7 +88,8 @@ impl Plugin for HudPlugin {
 const CONTROLS: &str = "WASD move   Shift sprint   Ctrl dash/tackle   Space jump (x2 in air)\n\
 Hold LMB: charge (locks nearest), release: throw   Q/E: curve   F: lob\n\
 RMB: catch - time it! red ring = PERFECT   Tab/MMB while charging: switch target\n\
-In the air: Q/E spin 180   W+Q/E front flip   S+Q/E back flip   Esc: free mouse";
+In the air: Q/E spin 180   W+Q/E front flip   S+Q/E back flip   Esc: free mouse\n\
+Parkour: jump along a tall wall = wall run (Space: wall jump)   jump into it = climb   grab ledges";
 
 fn spawn_hud(mut commands: Commands) {
     let text = |s: &str, size: f32| (Text::new(s), TextFont::from_font_size(size), TextColor(Color::WHITE));
@@ -467,6 +468,14 @@ fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {
     }
     if me.knocked {
         lines.push("LAUNCHED!".to_string());
+    }
+    match me.parkour {
+        ParkourPose::Hang => lines.push(
+            "HANGING: Space climb up   S+Space jump off   A/D shimmy   Ctrl let go   (throw/catch OK)".to_string(),
+        ),
+        ParkourPose::WallRunLeft | ParkourPose::WallRunRight => lines.push("WALL RUN! Space: wall jump".to_string()),
+        ParkourPose::Climb => lines.push("CLIMBING".to_string()),
+        ParkourPose::Mantle | ParkourPose::None => {}
     }
     if me.slimed > 0.0 {
         lines.push(format!("SLIMED! stuck and helpless {:.1}s", me.slimed));
