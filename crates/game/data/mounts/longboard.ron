@@ -5,7 +5,7 @@
     name: "Longboard",
     kind: Longboard,
     stance: Sideways,
-    stats: (top_speed: 14.0, push: 7.5, turn: 2.6, jump: 7.0, friction: 0.15, grind_speed: 11.0),
+    stats: (top_speed: 17.5, push: 9.38, turn: 2.6, jump: 7.67, friction: 0.15, grind_speed: 13.75),
     flips: [
         (name: "Long Kickflip",   input: (dir: None),      secs: 0.6,  points: 380, anim: (board_roll: 1.0, legs: Tuck)),
         (name: "Long Heelflip",   input: (dir: Down),      secs: 0.6,  points: 380, anim: (board_roll: -1.0, legs: Tuck)),

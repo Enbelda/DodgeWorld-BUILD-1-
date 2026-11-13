@@ -118,9 +118,27 @@ pub fn look(mouse: Res<AccumulatedMouseMotion>, locked: Res<CursorLocked>, mut c
 /// Camera position for a body centre and look angles, kept inside the arena walls
 /// (`half` is the arena's half size).
 pub fn camera_position(body: Vec3, yaw: f32, pitch: f32, half: f32) -> Vec3 {
+    use crate::sim::sewer;
     let rot = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
     let pivot = body + Vec3::Y * 0.7;
     let mut p = pivot + rot * OFFSET;
+    if body.y < -0.5 && body.y > sewer::SEWER_CEILING && body.x.abs() < 2.5 && body.z.abs() < 2.5 {
+        // Falling down the shaft: stay inside it, above the body, looking down.
+        let lim = sewer::HOLE_HALF;
+        p.x = p.x.clamp(-lim, lim);
+        p.z = p.z.clamp(-lim, lim);
+        p.y = p.y.max(body.y + 2.0);
+        return p;
+    }
+    if body.y < -0.5 {
+        // Down the hole: inside the sewer's walls, under its ceiling once there.
+        p.x = p.x.clamp(sewer::X_MIN + 0.3, sewer::X_MAX - 0.3);
+        p.z = p.z.clamp(sewer::Z_MIN + 0.3, sewer::Z_MAX - 0.3);
+        if body.y < sewer::SEWER_CEILING {
+            p.y = p.y.clamp(sewer::SEWER_FLOOR + 0.3, sewer::SEWER_CEILING - 0.3);
+        }
+        return p;
+    }
     let lim = half - 0.3;
     p.x = p.x.clamp(-lim, lim);
     p.z = p.z.clamp(-lim, lim);

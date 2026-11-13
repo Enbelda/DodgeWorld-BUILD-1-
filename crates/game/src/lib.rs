@@ -15,6 +15,7 @@ pub mod render;
 pub mod ride;
 pub mod rig;
 pub mod session;
+pub mod sewer_vis;
 pub mod sim;
 pub mod textures;
 
@@ -50,6 +51,7 @@ pub fn run(cfg: LaunchConfig) -> Result<(), String> {
             session::SessionPlugin,
             render::RenderPlugin,
             mount_vis::MountVisPlugin,
+            sewer_vis::SewerPlugin,
             hud::HudPlugin,
         ))
         .add_systems(Last, session::leave_on_exit)

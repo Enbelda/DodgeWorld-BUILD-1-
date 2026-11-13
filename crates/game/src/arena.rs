@@ -132,7 +132,7 @@ fn build_arena(
     let floor_red = textured(m, Color::srgb(0.86, 0.62, 0.50), &t.court, 0.55);
     let floor_blue = textured(m, Color::srgb(0.58, 0.66, 0.84), &t.court, 0.55);
     let paint = m.add(StandardMaterial { base_color: Color::srgb(0.96, 0.96, 0.94), perceptual_roughness: 0.4, ..default() });
-    commands.spawn((ArenaGeo, Transform::from_xyz(0.0, -0.1, 0.0), Collider::cuboid(half + 1.0, 0.1, half + 1.0)));
+    // (The floor's collider is built by the sewer module: it has a hole during the race.)
     let board = meshes.add(tiled_box(Vec3::new(half * 2.0, 0.1, half), 4.0));
     for (mat, z) in [(floor_red, half / 2.0), (floor_blue, -half / 2.0)] {
         commands.spawn((ArenaGeo, Mesh3d(board.clone()), MeshMaterial3d(mat), Transform::from_xyz(0.0, -0.05, z)));

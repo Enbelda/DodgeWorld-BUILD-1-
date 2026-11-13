@@ -11,8 +11,8 @@
 //!   R + W / R + S = front / back flip. One trick at a time; chain several before landing.
 //!   Landing a flip trick before 80% of it is done is a bail (knocked off balance for 1 s,
 //!   combo lost).
-//! - Holding F as you come down onto a rail or a ledge grinds it (F + keys picks the grind);
-//!   Space jumps off, the end of the rail pops you off.
+//! - Holding F with the feet over a rail or a ledge snaps onto it and grinds (F + keys picks
+//!   the grind), from up to GRIND_ABOVE over it; Space jumps off, the end pops you off.
 //! - Landing banks the combo: the sum of its tricks times how many there were (max x10).
 
 use bevy::math::Vec3;
@@ -26,9 +26,12 @@ pub const RIDE_GRAVITY: f32 = 22.0;
 pub const LAND_OK: f32 = 0.8;
 pub const BAIL_SECS: f32 = 1.0;
 /// How close (sideways) and how high above / below a rail's top the feet can be to lock on.
-const GRIND_REACH: f32 = 0.55;
-const GRIND_ABOVE: f32 = 0.9;
-const GRIND_BELOW: f32 = 0.3;
+/// Round 7: generous, so holding F anywhere over a rail snaps straight down onto it.
+const GRIND_REACH: f32 = 0.85;
+const GRIND_ABOVE: f32 = 2.4;
+const GRIND_BELOW: f32 = 0.35;
+/// Snapping only waits for an unfinished flip when the feet are at least this high over the rail.
+const GRIND_FLIP_WAIT: f32 = 0.35;
 /// Holding a grab past its time: extra points per second, as a share of the trick's points.
 const GRAB_BONUS: f32 = 0.5;
 pub const MAX_MULTIPLIER: u32 = 10;
@@ -129,6 +132,8 @@ pub struct Ride {
     pub airborne: bool,
     /// Pushing / striding animation phase.
     pub push_phase: f32,
+    /// Jumped off a rail and still going up: no snapping straight back on.
+    pub off_rail: bool,
 }
 
 pub fn heading_dir(yaw: f32) -> Vec3 {
@@ -161,6 +166,7 @@ impl Ride {
             bail: 0.0,
             airborne: false,
             push_phase: 0.0,
+            off_rail: false,
         }
     }
 
@@ -258,6 +264,7 @@ impl Ride {
                 // Ollie off the rail; the combo carries on.
                 self.grind = None;
                 self.airborne = true;
+                self.off_rail = true;
                 *vel_y = st.jump;
                 let at = rail.at(g.s.clamp(0.0, rail.len()));
                 return RideOut { vel: along * self.speed + Vec3::Y * *vel_y, place: Some(at), events: ev };
@@ -286,6 +293,45 @@ impl Ride {
                 *vel_y -= RIDE_GRAVITY * dt;
             }
             return RideOut { vel: fwd * self.speed + Vec3::Y * *vel_y, place: None, events: ev };
+        }
+
+        if *vel_y <= 0.0 {
+            self.off_rail = false;
+        }
+        // Grind: F held with the feet over a rail / ledge snaps onto it straight away.
+        if i.grind && !self.off_rail {
+            if let Some((rail, s)) = Ride::find_rail(feet, rails) {
+                let r = rails[rail];
+                let above = feet.y - r.at(s).y;
+                let mut snap = true;
+                if let Some(t) = self.trick {
+                    let secs = def.trick(t.cat, t.index).map_or(1.0, |tr| tr.secs);
+                    if matches!(t.cat, TrickCat::Flip | TrickCat::AirFlip) && t.t < secs * LAND_OK {
+                        if above > GRIND_FLIP_WAIT {
+                            // Let the flip finish first; snap once it is done.
+                            snap = false;
+                        } else {
+                            self.bail_out("came down on the rail mid-flip", &mut ev);
+                            return RideOut { vel: fwd * self.speed + Vec3::Y * *vel_y, place: None, events: ev };
+                        }
+                    } else {
+                        self.finish_trick(def);
+                    }
+                }
+                if snap {
+                    let sign = if fwd.dot(r.dir()) >= 0.0 { 1.0 } else { -1.0 };
+                    let index = def.find(TrickCat::Grind, i.keys).unwrap_or(0);
+                    if let Some(tr) = def.trick(TrickCat::Grind, index) {
+                        self.combo.names.push(tr.name.clone());
+                        ev.push(RideEvent::Grind(tr.name.clone()));
+                    }
+                    self.grind = Some(Grinding { rail, s, sign, index, t: 0.0 });
+                    self.speed = self.speed.max(4.0);
+                    self.airborne = true;
+                    *vel_y = 0.0;
+                    return RideOut { vel: r.dir() * sign * self.speed, place: Some(r.at(s) + Vec3::Y * 0.02), events: ev };
+                }
+            }
         }
 
         if i.grounded && *vel_y <= 0.0 {
@@ -336,31 +382,6 @@ impl Ride {
         // In the air.
         self.airborne = true;
         *vel_y -= RIDE_GRAVITY * dt;
-
-        // Grind: coming down onto a rail / ledge with F held.
-        if i.grind && *vel_y <= 1.0 {
-            if let Some((rail, s)) = Ride::find_rail(feet, rails) {
-                if let Some(t) = self.trick {
-                    let secs = def.trick(t.cat, t.index).map_or(1.0, |tr| tr.secs);
-                    if matches!(t.cat, TrickCat::Flip | TrickCat::AirFlip) && t.t < secs * LAND_OK {
-                        self.bail_out("came down on the rail mid-flip", &mut ev);
-                        return RideOut { vel: fwd * self.speed + Vec3::Y * *vel_y, place: None, events: ev };
-                    }
-                    self.finish_trick(def);
-                }
-                let r = rails[rail];
-                let sign = if fwd.dot(r.dir()) >= 0.0 { 1.0 } else { -1.0 };
-                let index = def.find(TrickCat::Grind, i.keys).unwrap_or(0);
-                if let Some(tr) = def.trick(TrickCat::Grind, index) {
-                    self.combo.names.push(tr.name.clone());
-                    ev.push(RideEvent::Grind(tr.name.clone()));
-                }
-                self.grind = Some(Grinding { rail, s, sign, index, t: 0.0 });
-                self.speed = self.speed.max(4.0);
-                *vel_y = 0.0;
-                return RideOut { vel: r.dir() * sign * self.speed, place: Some(r.at(s) + Vec3::Y * 0.02), events: ev };
-            }
-        }
 
         // The trick in progress.
         if let Some(mut t) = self.trick {
@@ -632,7 +653,9 @@ mod tests {
         r.run(1.0, RideInput { grind: true, ..push() });
         assert!(r.ride.grind.is_none(), "3 m away");
         assert!(Ride::find_rail(Vec3::new(3.2, 0.7, -5.0), &r.rails).is_some());
-        assert!(Ride::find_rail(Vec3::new(3.2, 2.0, -5.0), &r.rails).is_none(), "too high above it");
+        assert!(Ride::find_rail(Vec3::new(3.2, 2.0, -5.0), &r.rails).is_some(), "snaps from well above it");
+        assert!(Ride::find_rail(Vec3::new(3.2, 3.2, -5.0), &r.rails).is_none(), "too high above it");
+        assert!(Ride::find_rail(Vec3::new(4.2, 0.7, -5.0), &r.rails).is_none(), "beside it");
     }
 
     #[test]
@@ -656,5 +679,49 @@ mod tests {
         assert_eq!(r.speed, 1.0);
         r.blocked(5.0);
         assert_eq!(r.speed, 1.0, "never speeds up");
+    }
+
+    #[test]
+    fn holding_f_over_a_rail_snaps_on_while_still_rising() {
+        let mut r = Rig::new(MountKind::Skateboard);
+        r.rails = vec![Rail { a: Vec3::new(0.0, 0.55, -1.0), b: Vec3::new(0.0, 0.55, -30.0) }];
+        r.run(0.5, push());
+        r.frame(RideInput { jump: true, ..push() });
+        while r.feet.y < 0.3 {
+            r.frame(push());
+        }
+        assert!(r.vel_y > 0.0);
+        r.frame(RideInput { grind: true, ..push() });
+        assert!(r.ride.grind.is_some(), "snapped on the way up");
+        assert!((r.feet.y - 0.57).abs() < 0.01, "pulled down onto it: {}", r.feet);
+        // Jumping off with F still held does not snap straight back on.
+        r.run(0.3, RideInput { grind: true, ..push() });
+        r.frame(RideInput { jump: true, grind: true, ..push() });
+        r.run(0.15, RideInput { grind: true, ..push() });
+        assert!(r.ride.grind.is_none() && r.vel_y > 0.0, "still rising off it");
+        r.run(1.5, RideInput { grind: true, ..push() });
+        assert!(r.ride.grind.is_some(), "back on as it comes down");
+    }
+
+    #[test]
+    fn a_flip_finishes_before_snapping_from_high_up() {
+        let mut r = Rig::new(MountKind::Skateboard);
+        r.rails = vec![Rail { a: Vec3::new(0.0, 0.55, -1.0), b: Vec3::new(0.0, 0.55, -40.0) }];
+        r.run(0.5, push());
+        r.frame(RideInput { jump: true, ..push() });
+        r.frame(RideInput { flip: true, ..push() });
+        while r.feet.y < 1.0 {
+            r.frame(push());
+        }
+        r.frame(RideInput { grind: true, ..push() });
+        assert!(r.ride.grind.is_none() && !r.bailed(), "waits for the kickflip");
+        for _ in 0..120 {
+            r.frame(RideInput { grind: true, ..push() });
+            if r.ride.grind.is_some() {
+                break;
+            }
+        }
+        assert!(r.ride.grind.is_some() && !r.bailed());
+        assert_eq!(r.ride.combo.names[0], "Kickflip");
     }
 }

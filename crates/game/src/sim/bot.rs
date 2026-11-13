@@ -5,9 +5,14 @@
 use bevy::math::Vec3;
 
 use super::layout::Aabb;
-use super::{Action, BallState, Match, PlayerId, Team, BODY_RADIUS};
+use super::{sewer, Action, BallState, Match, PlayerId, RideView, Team, BODY_RADIUS};
+use crate::mounts::MountKind;
 
 pub const BOT_SPEED: f32 = 5.5;
+/// Bots run to the hole a bit quicker, and race the sewer at about a rider's pace
+/// (a little under a skateboard's top speed, so a good run beats them).
+const BOT_HOLE_SPEED: f32 = 7.0;
+pub const BOT_RACE_SPEED: f32 = 12.0;
 const THROW_RANGE: f32 = 22.0;
 const PREFERRED_RANGE: f32 = 13.0;
 const THREAT_RANGE: f32 = 8.0;
@@ -30,6 +35,8 @@ pub struct Brain {
     pub detour: f32,
     /// Whether we lock on for the throw we are holding (rolled once per ball).
     pub lock_this_throw: Option<bool>,
+    /// Sewer race: the racing-line waypoint we are heading for.
+    pub race_wp: usize,
 }
 
 pub fn yaw_toward(dir: Vec3) -> f32 {
@@ -204,6 +211,50 @@ pub fn steer(pos: Vec3, step: Vec3, side: f32, solids: &[Aabb], half: f32) -> (V
 }
 
 /// Keep a bot's feet out of solids and inside the arena (2D, ignores box height above head).
+/// Sewer race: run to the hole and jump in, then ride the racing line to the finish.
+pub fn race(m: &mut Match, id: PlayerId, dt: f32) {
+    let Some(pi) = m.players.iter().position(|p| p.id == id) else { return };
+    let p = &m.players[pi];
+    let pos = p.pos;
+    if !sewer::is_below(pos) {
+        // Up top: head for the hole and drop in.
+        let to = Vec3::new(-pos.x, 0.0, -pos.z);
+        let step = BOT_HOLE_SPEED * dt;
+        let p = &mut m.players[pi];
+        if to.length() <= sewer::HOLE_HALF * 0.6 {
+            p.pos.y = -0.05;
+            p.knock = Some(Vec3::new(0.0, -1.0, 0.0));
+            return;
+        }
+        // The low walls in the middle get walked around like anything else.
+        let side = p.brain.detour;
+        let (next, side) = steer(pos, to.normalize_or_zero() * step.min(to.length()), side, &m.solids, m.arena.half());
+        let p = &mut m.players[pi];
+        p.yaw = yaw_toward(to);
+        p.pos = next;
+        p.brain.detour = side;
+        return;
+    }
+    let mut brain = p.brain.clone();
+    brain.race_wp = sewer::next_waypoint(pos, brain.race_wp);
+    let wps = sewer::waypoints();
+    let goal = wps[brain.race_wp.min(wps.len() - 1)];
+    let to = Vec3::new(goal.x - pos.x, 0.0, goal.z - pos.z);
+    let finished = m.race.contains(&id);
+    let speed = if finished { 0.0 } else { BOT_RACE_SPEED };
+    let step = (speed * dt).min(to.length());
+    let next = collide_feet(pos + to.normalize_or_zero() * step, &m.sewer, 1e4).with_y(sewer::SEWER_FLOOR);
+    let p = &mut m.players[pi];
+    if to.length() > 0.1 {
+        p.yaw = yaw_toward(to);
+    }
+    p.pos = next;
+    // Drawn riding a skateboard.
+    let push = p.ride.map_or(0.0, |r| r.push) + dt * 6.0;
+    p.ride = Some(RideView { mount: MountKind::Skateboard, trick: None, grind: None, bail: false, speed, push });
+    p.brain = brain;
+}
+
 pub fn collide_feet(mut pos: Vec3, solids: &[Aabb], half: f32) -> Vec3 {
     for s in solids {
         let e = s.expanded(BODY_RADIUS);

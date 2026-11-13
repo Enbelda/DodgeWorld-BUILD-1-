@@ -4,7 +4,7 @@
     name: "Scooter",
     kind: Scooter,
     stance: Forward,
-    stats: (top_speed: 11.0, push: 9.5, turn: 3.8, jump: 8.0, friction: 0.3, grind_speed: 9.0),
+    stats: (top_speed: 13.75, push: 11.88, turn: 3.8, jump: 8.76, friction: 0.3, grind_speed: 11.25),
     flips: [
         (name: "Tailwhip",       input: (dir: None),      secs: 0.45, points: 350, anim: (frame_whip: 1.0)),
         (name: "Barspin",        input: (dir: Down),      secs: 0.4,  points: 300, anim: (bar_spin: 1.0)),

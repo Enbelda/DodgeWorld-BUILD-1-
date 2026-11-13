@@ -9,7 +9,7 @@ use crate::player::{Charge, LocalDash, LocalRide, LockOn, MoveIntent, DASH_CHARG
 use crate::session::{SessionSet, View};
 use crate::sim::ball::BallKind;
 use crate::sim::{
-    BallState, CoverPose, GameMode, MapId, ParkourPose, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS,
+    BallState, CoverPose, GameMode, MapId, ParkourPose, Phase, PlayerId, PlayerView, Snapshot, Team, HEARTS, KO_TARGET, MAX_PLAYERS, MAX_ROUNDS,
     PERFECT_SECS,
 };
 
@@ -324,13 +324,21 @@ fn update_hud(
                 Some((Phase::Lobby, _, _)) => "WARM-UP".to_string(),
                 Some((Phase::Playing, _, GameMode::Deathmatch)) => {
                     let alive = |t: Team| snap.map_or(0, |s| s.players.iter().filter(|p| p.team == t && p.alive()).count());
-                    format!("DEATHMATCH   RED {} standing  -  {} standing BLUE", alive(Team::Red), alive(Team::Blue))
+                    let (round, [r, b]) = snap.map_or((1, [0, 0]), |s| (s.round, s.rounds));
+                    format!("ROUND {round}/{MAX_ROUNDS}   RED {r} - {b} BLUE   ({} v {} standing)", alive(Team::Red), alive(Team::Blue))
                 }
+                Some((Phase::RoundOver { winner, secs }, _, _)) => {
+                    let w = if winner == Team::Red { "RED" } else { "BLUE" };
+                    let [r, b] = snap.map_or([0, 0], |s| s.rounds);
+                    format!("{w} TAKES THE ROUND ({r} - {b})   next in {:.0}s", secs.ceil())
+                }
+                Some((Phase::Race { secs }, _, _)) => race_banner(snap, me, secs),
                 Some((Phase::Playing, [r, b], GameMode::Standard)) => {
                     format!("RED {r}  -  {b} BLUE      first to {KO_TARGET}")
                 }
-                Some((Phase::Ended { winner }, [r, b], _)) => {
+                Some((Phase::Ended { winner }, [r, b], mode)) => {
                     let w = if winner == Team::Red { "RED" } else { "BLUE" };
+                    let [r, b] = if mode == GameMode::Deathmatch { snap.map_or([r, b], |s| s.rounds) } else { [r, b] };
                     format!("{w} WINS   {r} - {b}")
                 }
             },
@@ -349,7 +357,7 @@ fn update_hud(
                     }
                     let mode = match s.mode {
                         GameMode::Standard => "Standard (respawns, first to 10)",
-                        GameMode::Deathmatch => "Deathmatch (no respawns)",
+                        GameMode::Deathmatch => "Deathmatch (best of 4 rounds, sewer race after round 2)",
                     };
                     let look = match s.map {
                         MapId::Day => "day",
@@ -360,7 +368,7 @@ fn update_hud(
                     let host_keys = match s.phase {
                         Phase::Lobby => "Enter: start   B/N: add/remove bot   M: mode   V: map",
                         Phase::Ended { .. } => "Enter: back to warm-up   M: mode   V: map",
-                        Phase::Playing => "",
+                        Phase::Playing | Phase::RoundOver { .. } | Phase::Race { .. } => "",
                     };
                     if view.is_host && !host_keys.is_empty() {
                         lines.push(host_keys.to_string());
@@ -378,7 +386,7 @@ fn update_hud(
                 Some(m) if !m.alive() => {
                     let out_for_good = snap.is_some_and(|s| s.mode == GameMode::Deathmatch && s.phase == Phase::Playing);
                     if out_for_good {
-                        "OUT - spectating until the match ends".to_string()
+                        "OUT - spectating until the round ends".to_string()
                     } else {
                         format!("KNOCKED OUT - back in {:.1}s", m.respawn_timer)
                     }
@@ -389,6 +397,7 @@ fn update_hud(
                         BallKind::Boomerang => " BOOMERANG",
                         BallKind::Slime => " SLIME",
                         BallKind::Brick => " BRICK",
+                        BallKind::Golden => " GOLDEN STRING",
                     });
                     let ball = match (m.holding, m.powered, m.charged) {
                         (true, true, true) => format!("BALL{kind} (POWERED + CHARGED: click to throw!)"),
@@ -415,6 +424,9 @@ fn update_hud(
                     };
                     let sprint = if intent.sprint { "  SPRINT" } else { "" };
                     let mut s = format!("{ball}{speed}   {catch}\n{dashes}{sprint}");
+                    if crate::player::can_pull(&view) {
+                        s.push_str("\nGOLDEN STRING: X to yank whoever holds it / reel it in");
+                    }
                     if let Some(c) = charge.amount(time.elapsed_secs()) {
                         s.push_str(&format!("\nPOWER {}", bar(c, 20)));
                     }
@@ -423,6 +435,9 @@ fn update_hud(
             },
             HudText::Ride => {
                 let mut s = ride.ride.as_ref().map_or(String::new(), |r| ride_status(r, &lib.get(r.mount).name));
+                if let Some(snap) = snap.filter(|s| matches!(s.phase, Phase::Race { .. })) {
+                    s.push_str(&race_standings(snap));
+                }
                 for (_, m) in &ride.feed {
                     s.push_str(&format!("\n{m}"));
                 }
@@ -508,6 +523,50 @@ pub fn ride_status(r: &crate::ride::Ride, name: &str) -> String {
         s.push_str(&format!("\nCOMBO {} x{} = {}", r.combo.names.join(" + "), r.combo.multiplier(), r.combo.total()));
     }
     s
+}
+
+/// "1st", "2nd", "3rd", "4th"...
+pub fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+/// The sewer race banner: what to do, the countdown, and the standings.
+fn race_banner(snap: Option<&Snapshot>, me: Option<&PlayerView>, secs: f32) -> String {
+    use crate::sim::sewer;
+    let Some(s) = snap else { return String::new() };
+    let below = me.is_some_and(|m| sewer::is_below(Vec3::from_array(m.pos)));
+    if !below {
+        let left = (crate::sim::RACE_DROP_SECS - secs).max(0.0);
+        format!("SEWER RACE! JUMP DOWN THE HOLE IN THE MIDDLE ({left:.0}s)")
+    } else if me.is_some_and(|m| s.race.contains(&m.id)) {
+        let place = me.and_then(|m| s.race.iter().position(|id| *id == m.id)).unwrap_or(0) as u32 + 1;
+        format!("FINISHED {}!", ordinal(place))
+    } else {
+        "SEWER RACE - follow the arrows!".to_string()
+    }
+}
+
+/// Race standings, one per line: finishers in order, then the rest by how far along.
+fn race_standings(s: &Snapshot) -> String {
+    use crate::sim::sewer;
+    let mut rest: Vec<&PlayerView> = s.players.iter().filter(|p| !s.race.contains(&p.id)).collect();
+    rest.sort_by(|a, b| sewer::progress(Vec3::from_array(b.pos)).total_cmp(&sewer::progress(Vec3::from_array(a.pos))));
+    let order: Vec<String> = s
+        .race
+        .iter()
+        .filter_map(|id| s.players.iter().find(|p| p.id == *id))
+        .chain(rest)
+        .enumerate()
+        .map(|(i, p)| format!("{} {}", ordinal(i as u32 + 1), p.name))
+        .collect();
+    format!("\nRACE\n{}", order.join("\n"))
 }
 
 fn alerts(s: &Snapshot, me: &PlayerView, my_lock: Option<PlayerId>) -> String {

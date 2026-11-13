@@ -17,7 +17,8 @@ usage: brawl_game [options]
   --autopilot        bot-driven local player, for automated play-tests
   --drill            autopilot runs a parkour drill (wall runs, climbs, hangs)
   --grand            host on the grand arena (twice the size)
-  --ride-drill       autopilot rides every mount: rail grinds, flips, back flips";
+  --ride-drill       autopilot rides every mount: rail grinds, flips, back flips
+  --race             deathmatch that skips straight to the sewer race (testing)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -42,11 +43,13 @@ pub struct LaunchConfig {
     pub grand: bool,
     /// Autopilot runs the riding drill.
     pub ride_drill: bool,
+    /// Deathmatch straight into the sewer race.
+    pub race: bool,
 }
 
 impl Default for LaunchConfig {
     fn default() -> Self {
-        LaunchConfig { mode: Mode::Host { lan: true }, name: "Player".into(), port: DEFAULT_PORT, bots: 1, bind: None, autopilot: false, deathmatch: false, night: false, drill: false, grand: false, ride_drill: false }
+        LaunchConfig { mode: Mode::Host { lan: true }, name: "Player".into(), port: DEFAULT_PORT, bots: 1, bind: None, autopilot: false, deathmatch: false, night: false, drill: false, grand: false, ride_drill: false, race: false }
     }
 }
 
@@ -76,6 +79,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<LaunchConfig, St
             "--deathmatch" => cfg.deathmatch = true,
             "--night" => cfg.night = true,
             "--grand" => cfg.grand = true,
+            "--race" => {
+                cfg.race = true;
+                cfg.deathmatch = true;
+            }
             "--ride-drill" => {
                 cfg.ride_drill = true;
                 cfg.autopilot = true;

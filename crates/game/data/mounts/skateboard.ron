@@ -9,7 +9,7 @@
     name: "Skateboard",
     kind: Skateboard,
     stance: Sideways,
-    stats: (top_speed: 12.0, push: 9.0, turn: 3.4, jump: 8.0, friction: 0.25, grind_speed: 10.0),
+    stats: (top_speed: 15.0, push: 11.25, turn: 3.4, jump: 8.76, friction: 0.25, grind_speed: 12.5),
     flips: [
         (name: "Kickflip",        input: (dir: None),      secs: 0.45, points: 300, anim: (board_roll: 1.0, legs: Tuck)),
         (name: "Heelflip",        input: (dir: Down),      secs: 0.45, points: 300, anim: (board_roll: -1.0, legs: Tuck)),

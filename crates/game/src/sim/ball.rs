@@ -15,6 +15,9 @@ pub enum BallKind {
     Slime,
     /// Heavy red brick: big damage and knocks the target flat (stunned).
     Brick,
+    /// The sewer race winner's golden ball on a string: hits like a normal ball, and its
+    /// owner can tug the string (X) to yank whoever caught it into the air, or reel it in.
+    Golden,
 }
 
 impl BallKind {
@@ -47,8 +50,10 @@ pub const SPECIAL_SPEED: f32 = 1.3;
 pub const SPECIAL_BEND: f32 = 1.4;
 /// Round 5: curved and lobbed throws leave the hand another 40% faster.
 pub const FAST_SPECIAL: f32 = 1.4;
-/// Speed of a curved throw relative to a straight one (x1.3 then x1.4).
-pub const CURVE_SPEED: f32 = SPECIAL_SPEED * FAST_SPECIAL;
+/// Round 7: curved throws leave the hand another 25% faster.
+pub const FAST_CURVE: f32 = 1.25;
+/// Speed of a curved throw relative to a straight one (x1.3, x1.4, then x1.25).
+pub const CURVE_SPEED: f32 = SPECIAL_SPEED * FAST_SPECIAL * FAST_CURVE;
 /// Curve tuning before round 4: 26 m/s^2 sideways, 0.22 rad launch offset, both x1.3.
 const PREV_CURVE_ACCEL: f32 = 26.0 * 1.3;
 const PREV_CURVE_OFFSET: f32 = 0.22 * 1.3;
@@ -63,6 +68,13 @@ pub const CURVE_HOME_ETA: f32 = 0.35;
 pub const GUIDE_GAIN: f32 = 3.0;
 /// How far a curved throw starts angled away from the aim (it bends back).
 pub const CURVE_LAUNCH_OFFSET: f32 = PREV_CURVE_OFFSET * SPECIAL_BEND;
+/// Round 7: a curve at a target leaves this far (radians) off the line to it and flies a
+/// circular arc in, so the bend has the same round shape at any range.
+pub const CURVE_ARC_ANGLE: f32 = 0.5;
+/// The fastest a curve on its arc may turn (rad/s).
+const CURVE_MAX_TURN: f32 = 30.0;
+/// The last moment of a curve's flight is plain guidance onto the target (seconds).
+pub const CURVE_FINAL_ETA: f32 = 0.1;
 /// Lob tuning before this round (14 m/s at 0.85 rad, arc height x1.3).
 const PREV_LOB_FORWARD: f32 = 9.2398;
 const PREV_LOB_UP: f32 = 10.5179 * 1.140_175;
@@ -166,6 +178,39 @@ pub fn guide_to(vel: &mut Vec3, to_target: Vec3, eta: f32, dt: f32) {
     let angle = vel.normalize_or_zero().angle_between(to_target.normalize_or_zero());
     let rate = TRACK_TURN_RATE.max(GUIDE_GAIN * angle / eta.max(dt));
     turn_toward(vel, to_target, rate, dt, false);
+}
+
+/// Launch heading of a curve at a target: the line to it, turned `CURVE_ARC_ANGLE` away
+/// from the side it bends to (a right curve starts out to the left).
+pub fn arc_launch(from: Vec3, target: Vec3, curve: f32, speed: f32) -> Vec3 {
+    let to = Vec3::new(target.x - from.x, 0.0, target.z - from.z).normalize_or(Vec3::NEG_Z);
+    let dir = bevy::math::Quat::from_rotation_y(curve.signum() * CURVE_ARC_ANGLE) * to;
+    dir * speed
+}
+
+/// Steer a curve along the circle that passes through `target` and is tangent to its
+/// heading now (the turn rate is 2 v sin(a) / d), and set its climb so it arrives at the
+/// target's height at the end of the arc. Applied every step, the path is one clean arc.
+pub fn arc_to(vel: &mut Vec3, pos: Vec3, target: Vec3, gravity: f32, dt: f32) {
+    let flat = Vec3::new(vel.x, 0.0, vel.z);
+    let to = Vec3::new(target.x - pos.x, 0.0, target.z - pos.z);
+    let (v, d) = (flat.length(), to.length());
+    if v < 1e-3 || d < 1e-3 {
+        return;
+    }
+    let (a, b) = (flat / v, to / d);
+    let alpha = a.cross(b).y.atan2(a.dot(b));
+    let omega = if alpha.abs() > std::f32::consts::FRAC_PI_2 {
+        CURVE_MAX_TURN * alpha.signum()
+    } else {
+        (2.0 * v * alpha.sin() / d).clamp(-CURVE_MAX_TURN, CURVE_MAX_TURN)
+    };
+    let turned = bevy::math::Quat::from_rotation_y(omega * dt) * flat;
+    vel.x = turned.x;
+    vel.z = turned.z;
+    let len = if alpha.abs() < 1e-3 { d } else { d * alpha.abs().min(std::f32::consts::FRAC_PI_2) / alpha.abs().min(std::f32::consts::FRAC_PI_2).sin() };
+    let t = (len / v).max(dt);
+    vel.y = (target.y - pos.y) / t + 0.5 * gravity * t;
 }
 
 /// Bounce off a wall with normal `n`, twice as fast, capped.
@@ -484,8 +529,8 @@ mod tests {
     fn curved_throw_is_faster_again() {
         let (straight, _) = launch(Vec3::NEG_Z, throw(0.5, 0.0, false));
         let (curved, _) = launch(Vec3::NEG_Z, throw(0.5, 1.0, false));
-        // x1.3 (round 3) then 40% faster (round 5).
-        assert!((curved.length() / straight.length() - 1.3 * 1.4).abs() < 1e-4);
+        // x1.3 (round 3), 40% faster (round 5), 25% faster (round 7).
+        assert!((curved.length() / straight.length() - 1.3 * 1.4 * 1.25).abs() < 1e-4);
     }
 
     /// Sideways distance a full curve travels away from (and back to) the aim line.
@@ -679,5 +724,46 @@ mod tests {
         }
         assert_eq!(vel, Vec3::ZERO);
         assert!((pos.y - BALL_RADIUS).abs() < 0.02);
+    }
+
+    /// Fly a tracked curve from the origin at a target `d` metres down -Z; returns the
+    /// furthest it bulged sideways and the distance it missed by.
+    fn arc_flight(d: f32, curve: f32) -> (f32, f32) {
+        let target = Vec3::new(0.0, 1.0, -d);
+        let mut pos = Vec3::new(0.0, 1.5, 0.0);
+        let speed = MAX_THROW_SPEED * CURVE_SPEED;
+        let mut vel = arc_launch(pos, target, curve, speed);
+        let (mut bulge, mut miss) = (0.0_f32, f32::MAX);
+        for _ in 0..600 {
+            arc_to(&mut vel, pos, target, THROW_GRAVITY, 1.0 / 240.0);
+            step(&mut pos, &mut vel, 0.0, THROW_GRAVITY, 1.0 / 240.0, &[]);
+            if pos.z < -d {
+                break;
+            }
+            bulge = bulge.max(pos.x.abs());
+            miss = miss.min(pos.distance(target));
+        }
+        (bulge, miss)
+    }
+
+    #[test]
+    fn tracked_curve_flies_the_same_round_arc_at_any_range() {
+        for d in [6.0, 15.0, 30.0] {
+            let (bulge, miss) = arc_flight(d, 1.0);
+            assert!(miss < 0.35, "reaches the target at {d} m: missed by {miss}");
+            // A circular arc leaving at angle a off the chord bulges d/2 * tan(a/2).
+            let want = d / 2.0 * (CURVE_ARC_ANGLE / 2.0).tan();
+            assert!((bulge / want - 1.0).abs() < 0.12, "{d} m: bulge {bulge}, want {want}");
+        }
+        let (l, _) = arc_flight(15.0, -1.0);
+        let (r, _) = arc_flight(15.0, 1.0);
+        assert!((l - r).abs() < 1e-3, "mirrored");
+    }
+
+    #[test]
+    fn right_curve_at_a_target_starts_out_left() {
+        let v = arc_launch(Vec3::ZERO, Vec3::new(0.0, 0.0, -10.0), 1.0, 10.0);
+        assert!(v.x < 0.0 && v.z < 0.0);
+        assert!((v.length() - 10.0).abs() < 1e-4);
     }
 }

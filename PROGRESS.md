@@ -198,6 +198,42 @@
     the grind's angle. Bails windmill the arms.
   - HUD: mount, speed, live combo and trick feed on the left; H hides the controls list.
 
+- **Round 7 (Milestone 3 play-test requests).** 201 game tests + 23 ranked, clippy clean.
+  Verified in the real app: `--race` runs (autopilot and bots dropped in, raced, finished;
+  round 3 started on the next map with the golden ball; the autopilot won one race and
+  yanked two bots with the string), and a run without the autopilot (hole, countdown,
+  forced drop onto the last mount).
+  - Riding 25% faster (top speed, push and grind speed in every mount file) and the ollie
+    20% higher (jump speed x sqrt 1.2).
+  - Curve throws leave the hand 25% faster. A curve at someone now leaves 0.5 rad off the
+    line to them and flies a true circular arc into them (turn rate 2 v sin(a) / d each
+    step), so the bend has the same round shape at any range; cover wrapping still wins.
+  - Grinds: holding F with the feet anywhere over a rail (up to 2.4 m above, 0.85 m to the
+    side) snaps straight onto it, even while still rising; landing on a rail box counts.
+    An unfinished flip finishes first when you are high over the rail. Jumping off a rail
+    with F held doesn't snap you straight back on until you come down.
+  - Deathmatch is best of 4 rounds (3 round wins take it; 2-2 plays a deciding 5th). A
+    4 s break between rounds.
+  - Sewer race after round 2: a hole opens in the middle of the arena (green beam over
+    it). Jump in, fall 30 m down a shaft into the sewer, and your last mount (skateboard
+    if none) comes on before you land. Race the five-lane zig-zag course (grind rails, low
+    walls, pipes, water channels, arrows on the floor, lamps) to the chequered finish.
+    Anyone not in by 20 s is dropped in. The race ends when everyone finishes, 12 s after
+    the first finisher, or at 2 min. Then everyone comes up on the next map (the other
+    arena at the other time of day) for round 3. The sewer is never a match map.
+    Bots run to the hole and race the line at 12 m/s, drawn on skateboards.
+  - Golden string ball: the race winner starts every later round holding it (gold, with
+    a glowing string from their hand whenever it's out of it). It hits like a normal
+    ball. X (when it's out of your hands) tugs the string: an enemy holding it is yanked
+    5x a jump's height into the air and dragged up to 12 m toward you, and the ball reels
+    back to you; a ball in flight or on the floor just reels back. Teammates holding it
+    keep it. Bots that own it yank whoever catches it. (X still hops off a mount otherwise.)
+  - HUD: round and round score, the race instruction and countdown, standings on the
+    left, finishing place; the feed announces round wins, finishers, the golden ball and
+    yanks. Protocol 8.
+  - Fix: ball models are rebuilt when a slot's ball kind changes (switching arenas used to
+    leave e.g. a brick mesh on a normal ball).
+
 ## How to run
 - Host (with 1 bot): `cargo run -p brawl_game`
 - Join from another PC on the LAN: `cargo run -p brawl_game -- --join <host-ip> --name Ana`
@@ -210,15 +246,15 @@
 - Mounts: 1 skateboard, 2 longboard, 3 BMX, 4 inline skates, 5 scooter, 6 soap shoes, X off.
   Edit tricks in `crates/game/data/mounts/*.ron` (rebuild), or copy that folder to
   `data/mounts` next to where you start the game to change them without rebuilding.
-- Testing aids: `--ride-drill` (autopilot rides every mount: grinds, flip tricks, back flips),
+- Testing aids: `--race` (deathmatch that starts at once and skips straight to the sewer
+  race), `--ride-drill` (autopilot rides every mount: grinds, flip tricks, back flips),
   `--autopilot` (bot-driven local player, never grabs the mouse; host auto-starts;
   takes cover and throws over walls every fourth throw),
   `--drill` (autopilot loops the parkour drill on the +X flank),
   `--bind 127.0.0.1` (host on loopback only, no firewall prompt).
 
 ## In progress
-Nothing. Milestone 3 waiting for a human play-test of the feel (speeds, turning, trick
-timing, how easy grinds are to catch).
+Milestone 4 (maps): community map loader, skateable walls, grind rails, skate parks.
 
 ## Known bugs / limits
 - Movement is client-authoritative (fine for LAN with friends, not cheat-proof).
@@ -234,11 +270,15 @@ timing, how easy grinds are to catch).
   are seen holding, then throwing).
 - Taking cover behind a wall taller than 2.6 m: throws curve round its nearer end; there
   is no lean-out-sideways pose yet.
-- Bots don't ride mounts. There are no ramps or quarter pipes yet (Milestone 4 adds a skate
+- Bots don't ride mounts in matches (in the sewer race they glide the racing line on a
+  drawn skateboard and don't do tricks). There are no ramps or quarter pipes yet (Milestone 4 adds a skate
   park), so the longest tricks (0.8 s+) need the extra air from popping off a rail or
   dropping off a wall.
 - Mount models are built from simple shapes; the rider's hands and feet line up with the
   bars, deck and pedals only roughly.
+- Dropping into the sewer you land facing the way you fell; lane 1 runs to your right
+  (+X), shown by the floor arrows.
+- `--race` skips rounds 1-2 at 0-0, so a test match can run to a 5th round.
 
 ## Next step
 Milestone 4: community map loader (folder plus manifest); all base maps get skateable

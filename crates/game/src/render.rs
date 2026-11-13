@@ -35,6 +35,9 @@ struct Palette {
     ball_boomerang: [Handle<StandardMaterial>; 2],
     ball_slime: [Handle<StandardMaterial>; 2],
     ball_brick: [Handle<StandardMaterial>; 2],
+    ball_golden: [Handle<StandardMaterial>; 2],
+    string: Handle<StandardMaterial>,
+    string_mesh: Handle<Mesh>,
     ring: Handle<StandardMaterial>,
     ball: Handle<Mesh>,
     brick: Handle<Mesh>,
@@ -54,6 +57,8 @@ struct Avatar {
 #[derive(Component)]
 struct BallVis {
     index: usize,
+    /// What kind it was spawned as (the mesh and ring depend on it).
+    kind: BallKind,
     /// Flying last frame (to start the jiggle and the throw burst).
     was_flying: bool,
     jiggle: f32,
@@ -66,6 +71,10 @@ struct BallVis {
 /// The spinning band round the boomerang ball.
 #[derive(Component)]
 struct BoomerangRing;
+
+/// The golden ball's string.
+#[derive(Component)]
+struct GoldString;
 
 /// A wind streak (`k`) or trail ghost behind ball `ball`.
 #[derive(Component)]
@@ -185,6 +194,30 @@ fn make_palette(
                 ..default()
             }),
         ],
+        ball_golden: [
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.78, 0.25),
+                metallic: 0.95,
+                perceptual_roughness: 0.18,
+                emissive: LinearRgba::rgb(0.6, 0.4, 0.05),
+                clearcoat: 1.0,
+                ..default()
+            }),
+            materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.85, 0.3),
+                metallic: 0.9,
+                perceptual_roughness: 0.15,
+                emissive: LinearRgba::rgb(4.0, 2.8, 0.4),
+                ..default()
+            }),
+        ],
+        string: materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.9, 0.55),
+            emissive: LinearRgba::rgb(1.6, 1.2, 0.3),
+            unlit: true,
+            ..default()
+        }),
+        string_mesh: meshes.add(Cylinder::new(0.025, 1.0)),
         ring: materials.add(StandardMaterial {
             base_color: Color::srgb(0.95, 0.85, 1.0),
             emissive: LinearRgba::rgb(1.5, 0.8, 2.5),
@@ -290,8 +323,10 @@ fn sync_balls(
     view: Res<View>,
     palette: Res<Palette>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut balls: Query<(Entity, &mut BallVis, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), Without<BoomerangRing>>,
-    mut rings: Query<(&ChildOf, &mut Transform), With<BoomerangRing>>,
+    mut balls: Query<(Entity, &mut BallVis, &mut Transform, &mut MeshMaterial3d<StandardMaterial>), (Without<BoomerangRing>, Without<GoldString>)>,
+    mut rings: Query<(&ChildOf, &mut Transform), (With<BoomerangRing>, Without<GoldString>)>,
+    fx: Query<(Entity, &WindFx)>,
+    mut string: Query<(&mut Transform, &mut Visibility), With<GoldString>>,
     mut spin: Local<f32>,
 ) {
     let Some(snap) = view.snap.as_ref() else { return };
@@ -305,6 +340,16 @@ fn sync_balls(
             commands.entity(entity).despawn();
             continue;
         };
+        if b.kind != vis.kind {
+            // The map changed and this slot is a different ball now: build it afresh.
+            commands.entity(entity).despawn();
+            for (e, w) in &fx {
+                if w.ball == vis.index {
+                    commands.entity(e).despawn();
+                }
+            }
+            continue;
+        }
         have[vis.index] = true;
         let target = Vec3::from_array(b.pos);
         match b.state {
@@ -327,6 +372,7 @@ fn sync_balls(
             (BallKind::Boomerang, _) => &palette.ball_boomerang[flying as usize],
             (BallKind::Slime, _) => &palette.ball_slime[flying as usize],
             (BallKind::Brick, _) => &palette.ball_brick[flying as usize],
+            (BallKind::Golden, _) => &palette.ball_golden[flying as usize],
         };
         if mat.0 != *want {
             mat.0 = want.clone();
@@ -378,6 +424,30 @@ fn sync_balls(
             }
         }
     }
+    // The golden ball's string, from its owner's hand to the ball.
+    if let Ok((mut tf, mut vis)) = string.single_mut() {
+        let line = snap.golden.and_then(|owner| {
+            let o = snap.players.iter().find(|p| p.id == owner && p.alive())?;
+            let b = snap.balls.iter().find(|b| b.kind == BallKind::Golden)?;
+            if b.state == (BallState::Held { by: owner }) {
+                return None;
+            }
+            let fwd = Vec3::new(-o.yaw.sin(), 0.0, -o.yaw.cos());
+            Some((Vec3::from_array(o.pos) + Vec3::Y * 1.3 + fwd * 0.4, Vec3::from_array(b.pos)))
+        });
+        match line {
+            Some((a, b)) if a.distance(b) > 0.3 => {
+                let d = b - a;
+                tf.translation = (a + b) * 0.5;
+                tf.rotation = Quat::from_rotation_arc(Vec3::Y, d.normalize());
+                tf.scale = Vec3::new(1.0, d.length(), 1.0);
+                *vis = Visibility::Visible;
+            }
+            _ => *vis = Visibility::Hidden,
+        }
+    } else {
+        commands.spawn((GoldString, Mesh3d(palette.string_mesh.clone()), MeshMaterial3d(palette.string.clone()), Transform::default(), Visibility::Hidden));
+    }
     // The boomerang's band spins fast round it, faster in flight.
     for (parent, mut tf) in &mut rings {
         let flying = balls
@@ -396,7 +466,7 @@ fn sync_balls(
         let mesh = if b.kind == BallKind::Brick { palette.brick.clone() } else { palette.ball.clone() };
         let ball = commands
             .spawn((
-                BallVis { index: i, was_flying: false, jiggle: 0.0, phase: i as f32, spin: 0.0, trail: Vec::new() },
+                BallVis { index: i, kind: b.kind, was_flying: false, jiggle: 0.0, phase: i as f32, spin: 0.0, trail: Vec::new() },
                 Mesh3d(mesh),
                 MeshMaterial3d(palette.ball_free.clone()),
                 Transform::from_translation(Vec3::from_array(b.pos)),

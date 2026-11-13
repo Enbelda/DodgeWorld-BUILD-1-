@@ -30,7 +30,7 @@ use crate::parkour::{self, Drive, Parkour};
 use crate::session::{LocalActions, LocalTrick, View};
 use crate::sim::bot::yaw_toward;
 use crate::sim::{
-    layout, Action, ArenaId, GameEvent, PlayerId, TrickKind, TrickState, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT,
+    layout, sewer, Action, ArenaId, GameEvent, PlayerId, TrickKind, TrickState, BODY_HEIGHT, BODY_RADIUS, HOLD_HEIGHT,
     LOCK_RANGE, RECOIL_DECAY,
 };
 
@@ -113,19 +113,26 @@ pub struct LocalCover {
     pub toggled: bool,
 }
 
-/// The arena the local body moves in (follows the host's choice).
+/// The arena the local body moves in (follows the host's choice). Down the hole, `solids`
+/// and `rails` are the sewer's instead.
 #[derive(Resource, Default)]
 pub struct LocalArena {
     pub arena: Option<ArenaId>,
     pub solids: Vec<layout::Aabb>,
     /// Rails and ledges to grind.
     pub rails: Vec<layout::Rail>,
+    /// In the sewer right now.
+    pub below: bool,
+    /// The hole in the middle of the floor is open (sewer race).
+    pub hole: bool,
 }
 
 /// The local player's mount, and recent trick messages for the HUD.
 #[derive(Resource, Default)]
 pub struct LocalRide {
     pub ride: Option<Ride>,
+    /// The last mount ridden (dropping into the sewer puts you back on it).
+    pub last_mount: Option<MountKind>,
     /// (time, message), newest last.
     pub feed: Vec<(f32, String)>,
 }
@@ -484,14 +491,43 @@ fn obey_teleports(
     }
 }
 
-/// Keep the local copy of the arena's boxes in step with the host's arena.
-fn track_arena(view: Res<View>, mut local: ResMut<LocalArena>) {
+/// Keep the local copy of the arena's boxes in step with the host's arena (or the sewer's,
+/// once we are down the hole).
+fn track_arena(
+    view: Res<View>,
+    mut local: ResMut<LocalArena>,
+    mut parkour: ResMut<LocalParkour>,
+    mut cover: ResMut<LocalCover>,
+    body: Single<&Transform, With<LocalBody>>,
+) {
     let arena = view.snap.as_ref().map_or(ArenaId::Classic, |s| s.arena);
-    if local.arena != Some(arena) {
+    local.hole = view.snap.as_ref().is_some_and(|s| matches!(s.phase, crate::sim::Phase::Race { .. }));
+    let below = sewer::is_below(body.translation - Vec3::Y * FEET_OFFSET);
+    if local.arena != Some(arena) || local.below != below {
         local.arena = Some(arena);
-        local.solids = layout::solids(arena);
-        local.rails = layout::rails(arena);
+        local.below = below;
+        (local.solids, local.rails) = if below {
+            (sewer::solids(), sewer::rails())
+        } else {
+            (layout::solids(arena), layout::rails(arena))
+        };
+        // Wall indices refer to the old list.
+        parkour.0.reset();
+        cover.cover = None;
     }
+}
+
+/// Do we own the golden string ball, out of our hands right now?
+pub fn can_pull(view: &View) -> bool {
+    let (Some(s), Some(me)) = (view.snap.as_ref(), view.local) else { return false };
+    let team = s.players.iter().find(|p| p.id == me).map(|p| p.team);
+    let mine = |by: PlayerId| s.players.iter().any(|p| p.id == by && Some(p.team) == team);
+    s.golden == Some(me)
+        && s.balls.iter().any(|b| {
+            b.kind == crate::sim::ball::BallKind::Golden
+                && !matches!(b.state, crate::sim::BallState::Held { by } if mine(by))
+                && !matches!(b.state, crate::sim::BallState::Returning { .. })
+        })
 }
 
 /// Tab / middle mouse toggles lock-on. Drops the lock when the target is gone or dead.
@@ -710,7 +746,15 @@ pub fn move_local_body(
 
     // 1-6: hop on that mount (the same key again, or X, hops off).
     let now = time.elapsed_secs();
-    if let Some(kind) = intent.mount {
+    // Falling down the hole into the sewer: back on our last mount before we land.
+    let mut mount = intent.mount;
+    if arena.hole && ride.ride.is_none() && feet.y < sewer::BELOW && !grounded && mount.is_none() {
+        let kind = ride.last_mount.unwrap_or(MountKind::Skateboard);
+        info!("sewer: dropping in, mounting the {}", lib.get(kind).name);
+        mount = Some(kind);
+    }
+    if let Some(kind) = mount {
+        ride.last_mount = Some(kind);
         if ride.ride.as_ref().is_some_and(|r| r.mount == kind) {
             ride.ride = None;
             info!("mount: hopped off");
@@ -726,8 +770,14 @@ pub fn move_local_body(
             ride.feed.push((now, format!("Riding the {name}")));
         }
     }
-    if intent.dismount && ride.ride.take().is_some() {
-        info!("mount: hopped off");
+    // X: tug the golden ball's string if it's ours and out of our hands, else hop off.
+    if intent.dismount {
+        if can_pull(&view) {
+            info!("golden: pulled the string");
+            actions.0.push(Action::Pull);
+        } else if ride.ride.take().is_some() {
+            info!("mount: hopped off");
+        }
     }
     if ride.ride.is_some() {
         ride_frame(&intent, &lib, &arena, output, feet, grounded, dt, now, recoil, &mut ride, &mut dash, &mut b, &mut actions);

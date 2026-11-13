@@ -10,6 +10,10 @@
 //! rolls up to the rail on the +X side, ollies onto it holding F to grind, flips off the
 //! end and lands, then (every other lap) ollies again for a back flip.
 //!
+//! In a sewer race it runs to the hole, drops in (the mount comes on by itself), rides
+//! the racing line to the finish, ollies now and then and grinds any rail it passes over.
+//! Owning the golden ball, it yanks whoever catches it.
+//!
 //! With `--drill` it instead loops a parkour drill on the +X flank: wall run along the outer
 //! wall, wall jump across to the panel and wall run on it, then climb the panel, hang from
 //! its ledge (throwing from there if holding a ball), shimmy, climb up on top and drop off.
@@ -76,6 +80,9 @@ pub struct AutoState {
     cover_step: u32,
     cover_t: f32,
     covers: u32,
+    /// Sewer race: racing-line waypoint and time since the last ollie.
+    race_wp: usize,
+    race_hop: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -108,6 +115,22 @@ pub fn drive(
         return;
     }
     let feet = body.translation - Vec3::Y * FEET_OFFSET;
+    if matches!(snap.phase, crate::sim::Phase::Race { .. }) {
+        race_pilot(&mut st, dt, feet, &mut cam, &mut intent);
+        return;
+    }
+    st.race_wp = 0;
+    // Our golden ball got caught by an enemy: yank them.
+    let enemy_has_it = |by: crate::sim::PlayerId| snap.players.iter().any(|p| p.id == by && p.team != me.team);
+    if crate::player::can_pull(&view)
+        && snap
+            .balls
+            .iter()
+            .any(|b| b.kind == crate::sim::ball::BallKind::Golden && matches!(b.state, BallState::Held { by } if enemy_has_it(by)))
+    {
+        info!("autopilot: yanking the golden string");
+        intent.dismount = true;
+    }
     if ride_on.0 {
         ride_drill(&mut rs, dt, feet, &ride, &mut cam, &mut intent);
         return;
@@ -686,5 +709,49 @@ fn ride_drill(rs: &mut RideDrillState, dt: f32, feet: Vec3, ride: &LocalRide, ca
             rs.step = 0;
             rs.t = 0.0;
         }
+    }
+}
+
+/// One frame of the sewer race: to the hole, down it, then along the racing line,
+/// sprinting, with an ollie every couple of seconds and F held to grind rails we pass.
+fn race_pilot(st: &mut AutoState, dt: f32, feet: Vec3, cam: &mut FollowCamera, intent: &mut MoveIntent) {
+    use crate::sim::sewer;
+    cam.pitch = -0.35;
+    if !sewer::is_below(feet) {
+        let to = Vec3::new(-feet.x, 0.0, -feet.z);
+        if to.length() > 0.05 {
+            cam.yaw = yaw_toward(to);
+            intent.dir = to.normalize() * to.length().min(1.0);
+        }
+        intent.sprint = to.length() > 3.0;
+        return;
+    }
+    let before = st.race_wp;
+    st.race_wp = sewer::next_waypoint(feet, st.race_wp);
+    if st.race_wp != before {
+        info!("autopilot race: waypoint {} at {:.0} m along the course", st.race_wp, sewer::progress(feet));
+    }
+    let wps = sewer::waypoints();
+    let goal = wps[st.race_wp.min(wps.len() - 1)];
+    let to = Vec3::new(goal.x - feet.x, 0.0, goal.z - feet.z);
+    if to.length() > 0.05 {
+        // Turn the camera smoothly so carving follows it.
+        let want = yaw_toward(to);
+        let mut d = want - cam.yaw;
+        while d > std::f32::consts::PI {
+            d -= std::f32::consts::TAU;
+        }
+        while d < -std::f32::consts::PI {
+            d += std::f32::consts::TAU;
+        }
+        cam.yaw += d * (1.0 - (-8.0 * dt).exp());
+        intent.dir = to.normalize();
+    }
+    intent.sprint = true;
+    intent.trick_grind = true;
+    st.race_hop += dt;
+    if st.race_hop > 2.5 && to.length() > 12.0 {
+        st.race_hop = 0.0;
+        intent.jump = true;
     }
 }

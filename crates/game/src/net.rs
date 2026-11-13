@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sim::{Action, Match, ParkourPose, PlayerId, Snapshot, TrickState, CoverPose, RideView};
 
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 8;
 pub const DEFAULT_PORT: u16 = 47800;
 /// A peer that sends nothing for this long is dropped.
 pub const TIMEOUT_SECS: f64 = 5.0;

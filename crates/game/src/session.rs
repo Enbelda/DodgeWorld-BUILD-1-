@@ -21,6 +21,8 @@ pub struct HostSession {
     send_accum: f32,
     /// Events not yet sent to peers.
     unsent: Vec<GameEvent>,
+    /// `--race`: skip straight to the sewer race once the match starts.
+    race_test: bool,
 }
 
 #[derive(Resource)]
@@ -90,7 +92,10 @@ pub fn build_session(cfg: &LaunchConfig) -> Result<(Session, String), String> {
             } else {
                 (None, "Offline practice".to_string())
             };
-            let host = HostSession { sim, net, local, accum: 0.0, send_accum: 0.0, unsent: Vec::new() };
+            if cfg.race {
+                sim.set_mode(GameMode::Deathmatch);
+            }
+            let host = HostSession { sim, net, local, accum: 0.0, send_accum: 0.0, unsent: Vec::new(), race_test: cfg.race };
             Ok((Session::Host(Box::new(host)), status))
         }
         Mode::Join(addr) => {
@@ -125,6 +130,12 @@ fn host_controls(
     let Session::Host(host) = session.as_mut() else { return };
     // Automated play-tests start by themselves: offline at once, on LAN once a peer joined.
     let peers_ready = host.net.as_ref().is_none_or(|n| n.peer_count() > 0);
+    let race_test = host.race_test;
+    if host.race_test && host.sim.phase == Phase::Playing {
+        host.race_test = false;
+        host.sim.round = crate::sim::RACE_AFTER_ROUND;
+        host.sim.start_race();
+    }
     let sim = &mut host.sim;
     match sim.phase {
         Phase::Lobby | Phase::Ended { .. } if keys.just_pressed(KeyCode::KeyM) => {
@@ -141,7 +152,7 @@ fn host_controls(
             sim.set_map(map);
         }
         Phase::Lobby => {
-            if auto.0 && time.elapsed_secs() > 3.0 && peers_ready {
+            if (auto.0 || race_test) && time.elapsed_secs() > 3.0 && peers_ready {
                 sim.start();
             }
             if keys.just_pressed(KeyCode::KeyB) {
@@ -160,7 +171,7 @@ fn host_controls(
                 sim.to_lobby();
             }
         }
-        Phase::Playing => {}
+        Phase::Playing | Phase::RoundOver { .. } | Phase::Race { .. } => {}
     }
 }
 
@@ -288,6 +299,20 @@ fn tick_session(
                 let extra = if charged { " - ball charged!" } else { "" };
                 format!("{} landed a {points}-point combo{extra}", view.name_of(player))
             }
+            GameEvent::RoundWon { winner, round } => format!("{winner:?} team takes round {round}!"),
+            GameEvent::RoundStarted { round } => format!("Round {round} - fight!"),
+            GameEvent::RaceStarted => "SEWER RACE! Jump down the hole in the middle!".to_string(),
+            GameEvent::RaceFinished { player, place } => {
+                format!("{} finished the race {}", view.name_of(player), crate::hud::ordinal(place))
+            }
+            GameEvent::RaceEnded { winner: Some(w) } => {
+                format!("{} won the sewer race and gets the GOLDEN STRING BALL!", view.name_of(w))
+            }
+            GameEvent::RaceEnded { winner: None } => "Nobody finished the sewer race".to_string(),
+            GameEvent::Yanked { by, target } => {
+                format!("{} YANKED {} sky-high with the golden string!", view.name_of(by), view.name_of(target))
+            }
+            GameEvent::Reeled { owner } => format!("{} reeled in the golden ball", view.name_of(owner)),
             GameEvent::MatchStarted => "Match started!".to_string(),
             GameEvent::MatchEnded { winner } => format!("{winner:?} team wins!"),
         };

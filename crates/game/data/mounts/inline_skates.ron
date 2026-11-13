@@ -5,7 +5,7 @@
     name: "Inline Skates",
     kind: InlineSkates,
     stance: Skates,
-    stats: (top_speed: 11.0, push: 10.0, turn: 4.5, jump: 8.5, friction: 0.3, grind_speed: 9.5),
+    stats: (top_speed: 13.75, push: 12.5, turn: 4.5, jump: 9.31, friction: 0.3, grind_speed: 11.88),
     flips: [
         (name: "Flatspin 360",   input: (dir: None),      secs: 0.5,  points: 300, anim: (body_spin: 1.0, legs: Tuck)),
         (name: "Flatspin 540",   input: (dir: Down),      secs: 0.65, points: 450, anim: (body_spin: 1.5, legs: Tuck)),

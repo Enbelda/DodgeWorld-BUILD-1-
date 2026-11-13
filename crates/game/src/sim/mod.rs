@@ -4,6 +4,7 @@
 pub mod ball;
 pub mod bot;
 pub mod layout;
+pub mod sewer;
 
 use bevy::math::Vec3;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,22 @@ pub const RICOCHET_LIFT: f32 = 5.0;
 pub const KNOCK_GRAVITY: f32 = 22.0;
 /// Curved throws track an enemy within this cone of the aim (radians).
 const TRACK_CONE: f32 = 0.7;
+/// Deathmatch is best of four rounds: three round wins take it (2-2 goes to a fifth).
+pub const ROUNDS_TO_WIN: u32 = 3;
+pub const MAX_ROUNDS: u32 = 4;
+/// After this round the sewer race takes everyone to the next map.
+pub const RACE_AFTER_ROUND: u32 = 2;
+/// Pause between rounds.
+pub const ROUND_BREAK_SECS: f32 = 4.0;
+/// Anyone who has not jumped down the hole by now is dropped in.
+pub const RACE_DROP_SECS: f32 = 20.0;
+/// The race ends this long after the first racer finishes (or when everyone has).
+pub const RACE_GRACE_SECS: f32 = 12.0;
+pub const RACE_MAX_SECS: f32 = 120.0;
+/// The golden string ball's yank: 5x the height of a jump (8 m/s, so 8 * sqrt 5 up) and
+/// pulled toward the thrower by up to this far.
+pub const YANK_LIFT: f32 = 17.888_544;
+pub const YANK_PULL_MAX: f32 = 12.0;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Team {
@@ -87,12 +104,23 @@ impl Team {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum Phase {
     /// Warm-up: players run around and throw, KOs don't count.
     Lobby,
     Playing,
+    /// Deathmatch: a round was won; the next starts when `secs` runs out.
+    RoundOver { winner: Team, secs: f32 },
+    /// Deathmatch: the sewer race between maps (`secs` since it began).
+    Race { secs: f32 },
     Ended { winner: Team },
+}
+
+impl Phase {
+    /// Between rounds or racing: no throwing, catching or knockouts.
+    pub fn is_break(self) -> bool {
+        matches!(self, Phase::RoundOver { .. } | Phase::Race { .. })
+    }
 }
 
 /// Something a player does that the host must apply exactly once.
@@ -105,6 +133,8 @@ pub enum Action {
     Lock { target: Option<PlayerId> },
     /// Landed a trick combo worth `points` on a mount.
     Style { points: u32 },
+    /// X: tug the golden ball's string (yank whoever holds it, or reel it back).
+    Pull,
 }
 
 /// Standard: knocked-out players respawn, first team to `KO_TARGET` wins.
@@ -352,6 +382,17 @@ pub enum GameEvent {
     Combo { player: PlayerId, points: u32, charged: bool },
     MatchStarted,
     MatchEnded { winner: Team },
+    RoundWon { winner: Team, round: u32 },
+    RoundStarted { round: u32 },
+    /// The hole is open: jump in.
+    RaceStarted,
+    RaceFinished { player: PlayerId, place: u32 },
+    /// The race is over; `winner` (if anyone finished) gets the golden string ball.
+    RaceEnded { winner: Option<PlayerId> },
+    /// The golden ball's owner yanked whoever was holding it into the air.
+    Yanked { by: PlayerId, target: PlayerId },
+    /// The golden ball's owner reeled it back in.
+    Reeled { owner: PlayerId },
 }
 
 pub struct Match {
@@ -365,9 +406,19 @@ pub struct Match {
     pub balls: Vec<Ball>,
     pub score: [u32; 2],
     pub solids: Vec<Aabb>,
+    /// The sewer under the arena (raced through between deathmatch maps).
+    pub sewer: Vec<Aabb>,
     pub events: Vec<GameEvent>,
     pub rng: Rng,
     next_id: PlayerId,
+    /// Deathmatch round wins per team, and the round being played (1-based).
+    pub rounds: [u32; 2],
+    pub round: u32,
+    /// Sewer race finishers, first to last, and when the first one crossed the line.
+    pub race: Vec<PlayerId>,
+    race_first: Option<f32>,
+    /// The sewer race winner owns the golden string ball for the rest of the match.
+    pub golden: Option<PlayerId>,
 }
 
 impl Default for Match {
@@ -387,10 +438,16 @@ impl Match {
             balls: Vec::new(),
             score: [0, 0],
             solids: layout::solids(ArenaId::Classic),
+            sewer: sewer::solids(),
             cover: layout::cover(ArenaId::Classic),
             events: Vec::new(),
             rng: Rng(0x9E37_79B9_7F4A_7C15),
             next_id: 0,
+            rounds: [0, 0],
+            round: 0,
+            race: Vec::new(),
+            race_first: None,
+            golden: None,
         };
         m.reset_balls();
         m
@@ -495,7 +552,11 @@ impl Match {
         if let Some(p) = self.player_mut(id) {
             if p.alive() && pos.is_finite() && yaw.is_finite() && !p.helpless() {
                 p.yaw = yaw;
-                p.pos = pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim));
+                p.pos = if sewer::is_below(pos) {
+                    sewer::clamp(pos)
+                } else {
+                    pos.clamp(Vec3::new(-lim, -50.0, -lim), Vec3::new(lim, 50.0, lim))
+                };
             }
         }
     }
@@ -567,9 +628,7 @@ impl Match {
             return false;
         }
         if self.arena != arena {
-            self.arena = arena;
-            self.solids = layout::solids(arena);
-            self.cover = layout::cover(arena);
+            self.load_arena(arena);
             self.reset_balls();
             let ids: Vec<PlayerId> = self.players.iter().map(|p| p.id).collect();
             for id in ids {
@@ -577,6 +636,17 @@ impl Match {
             }
         }
         true
+    }
+
+    fn load_arena(&mut self, arena: ArenaId) {
+        self.arena = arena;
+        self.solids = layout::solids(arena);
+        self.cover = layout::cover(arena);
+    }
+
+    /// Is the hole down to the sewer open in the middle of the arena?
+    pub fn hole_open(&self) -> bool {
+        matches!(self.phase, Phase::Race { .. })
     }
 
     pub fn half(&self) -> f32 {
@@ -595,6 +665,10 @@ impl Match {
         }
         self.rebalance_teams();
         self.score = [0, 0];
+        self.rounds = [0, 0];
+        self.round = 1;
+        self.race.clear();
+        self.golden = None;
         self.reset_balls();
         let ids: Vec<PlayerId> = self.players.iter().map(|p| p.id).collect();
         for id in ids {
@@ -613,6 +687,16 @@ impl Match {
     pub fn to_lobby(&mut self) {
         self.phase = Phase::Lobby;
         self.score = [0, 0];
+        self.rounds = [0, 0];
+        self.round = 0;
+        self.golden = None;
+        self.balls.retain(|b| b.kind != BallKind::Golden);
+        for p in &mut self.players {
+            p.ride = if p.bot { None } else { p.ride };
+            if p.holding.is_some_and(|h| h >= self.balls.len()) {
+                p.holding = None;
+            }
+        }
         let out: Vec<PlayerId> = self.players.iter().filter(|p| !p.alive()).map(|p| p.id).collect();
         for id in out {
             self.respawn(id);
@@ -635,8 +719,116 @@ impl Match {
             (false, true) => Team::Blue,
             _ => return,
         };
-        self.phase = Phase::Ended { winner };
-        self.events.push(GameEvent::MatchEnded { winner });
+        // Best of four rounds; the sewer race after round two moves everyone to the next map.
+        self.rounds[winner.index()] += 1;
+        self.events.push(GameEvent::RoundWon { winner, round: self.round });
+        if self.rounds[winner.index()] >= ROUNDS_TO_WIN {
+            self.phase = Phase::Ended { winner };
+            self.events.push(GameEvent::MatchEnded { winner });
+        } else if self.round == RACE_AFTER_ROUND {
+            self.start_race();
+        } else {
+            self.phase = Phase::RoundOver { winner, secs: ROUND_BREAK_SECS };
+        }
+    }
+
+    /// Open the hole in the middle of the arena: everyone back on their feet, then down it.
+    pub fn start_race(&mut self) {
+        self.phase = Phase::Race { secs: 0.0 };
+        self.race.clear();
+        self.race_first = None;
+        self.reset_balls();
+        let ids: Vec<PlayerId> = self.players.iter().map(|p| p.id).collect();
+        for id in ids {
+            self.respawn(id);
+            if let Some(p) = self.player_mut(id) {
+                p.brain.race_wp = 0;
+            }
+        }
+        self.events.push(GameEvent::RaceStarted);
+    }
+
+    /// The next deathmatch round: fresh balls, everyone respawned, the golden ball (if
+    /// someone won the race) in its owner's hands.
+    fn next_round(&mut self) {
+        self.round += 1;
+        self.reset_balls();
+        let ids: Vec<PlayerId> = self.players.iter().map(|p| p.id).collect();
+        for id in ids {
+            self.respawn(id);
+        }
+        if let Some(owner) = self.golden {
+            if let Some(pi) = self.players.iter().position(|p| p.id == owner) {
+                let bi = self.balls.len();
+                let mut b = Ball::new(self.players[pi].pos + Vec3::Y * BALL_RADIUS, BallKind::Golden);
+                b.state = BallState::Held { by: owner };
+                b.pos = self.players[pi].hold_point();
+                self.balls.push(b);
+                self.players[pi].holding = Some(bi);
+            }
+        }
+        self.phase = Phase::Playing;
+        self.events.push(GameEvent::RoundStarted { round: self.round });
+    }
+
+    /// Round breaks count down; the race drops stragglers in, records finishers, and ends.
+    fn tick_phase(&mut self, dt: f32) {
+        match self.phase {
+            Phase::RoundOver { winner, secs } => {
+                let secs = secs - dt;
+                if secs <= 0.0 {
+                    self.next_round();
+                } else {
+                    self.phase = Phase::RoundOver { winner, secs };
+                }
+            }
+            Phase::Race { secs } => {
+                let secs = secs + dt;
+                self.phase = Phase::Race { secs };
+                if secs >= RACE_DROP_SECS {
+                    for (n, p) in self.players.iter_mut().filter(|p| !sewer::is_below(p.pos)).enumerate() {
+                        p.pos = sewer::drop_point(n);
+                        p.slime = None;
+                        p.stun = 0.0;
+                        // Bots fall the rest of the way; humans fall on their own client.
+                        p.knock = if p.bot { Some(Vec3::ZERO) } else { None };
+                        p.teleports = p.teleports.wrapping_add(1);
+                    }
+                }
+                let crossed: Vec<PlayerId> = self
+                    .players
+                    .iter()
+                    .filter(|p| p.alive() && !self.race.contains(&p.id) && sewer::finished(p.pos))
+                    .map(|p| p.id)
+                    .collect();
+                for id in crossed {
+                    self.race.push(id);
+                    self.events.push(GameEvent::RaceFinished { player: id, place: self.race.len() as u32 });
+                    self.race_first.get_or_insert(secs);
+                }
+                let everyone = self.players.iter().all(|p| self.race.contains(&p.id));
+                let grace_over = self.race_first.is_some_and(|t| secs - t >= RACE_GRACE_SECS);
+                if everyone || grace_over || secs >= RACE_MAX_SECS {
+                    self.end_race();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Out of the sewer onto the next map; the winner gets the golden string ball.
+    fn end_race(&mut self) {
+        let winner = self.race.first().copied();
+        self.golden = winner;
+        self.events.push(GameEvent::RaceEnded { winner });
+        let (arena, map) = next_deathmatch_map(self.arena, self.map);
+        self.map = map;
+        self.load_arena(arena);
+        for p in self.players.iter_mut().filter(|p| p.bot) {
+            p.ride = None;
+            p.knock = None;
+        }
+        self.next_round();
     }
 
     /// Respawns are off during a deathmatch.
@@ -693,6 +885,10 @@ impl Match {
         if !p.alive() || matches!(self.phase, Phase::Ended { .. }) {
             return;
         }
+        // Between rounds and in the race nobody throws, catches or tugs.
+        if self.phase.is_break() && matches!(action, Action::Throw { .. } | Action::Catch | Action::Pull) {
+            return;
+        }
         // Stunned, slimed or launched: can't do anything but wait (letting go of a lock is fine).
         if p.helpless() && !matches!(action, Action::Lock { target: None }) {
             return;
@@ -737,6 +933,13 @@ impl Match {
                 }
                 // Curves and lobs track their target (a dash shakes them off).
                 let track = if curve != 0.0 || lob { aimed_at } else { None };
+                // A curve at someone leaves off the line to them and flies a round arc in.
+                if curve != 0.0 && !lob {
+                    if let Some(t) = track.and_then(|t| self.player(t)) {
+                        let flat = Vec3::new(vel.x, 0.0, vel.z).length();
+                        vel = ball::arc_launch(origin, t.pos, curve, flat) + Vec3::Y * vel.y;
+                    }
+                }
                 let b = &mut self.balls[bi];
                 b.pos = origin;
                 b.vel = vel;
@@ -747,6 +950,7 @@ impl Match {
                 let team = self.players[pi].team;
                 self.players[pi].lock = target.filter(|t| self.valid_lock(team, *t));
             }
+            Action::Pull => self.pull(id),
             Action::Style { points } => {
                 let p = &mut self.players[pi];
                 let charged = points >= STYLE_CHARGE_POINTS && p.holding.is_some() && !p.charged;
@@ -787,6 +991,7 @@ impl Match {
         self.step_balls(dt);
         self.pickups();
         self.check_elimination();
+        self.tick_phase(dt);
     }
 
     fn tick_players(&mut self, dt: f32) {
@@ -798,9 +1003,11 @@ impl Match {
         }
         let respawns = self.respawns_enabled();
         let mut to_respawn = Vec::new();
-        let solids = &self.solids;
-        let half = self.arena.half();
+        let racing = self.hole_open();
         for p in &mut self.players {
+            // Down in the sewer the sewer's walls hold you in, not the arena's.
+            let (solids, half) = if sewer::is_below(p.pos) { (&self.sewer, 1e4) } else { (&self.solids, self.arena.half()) };
+            let floor = if sewer::is_below(p.pos) { sewer::SEWER_FLOOR } else { 0.0 };
             p.stun = (p.stun - dt).max(0.0);
             if p.recoil != Vec3::ZERO {
                 if p.bot && !p.helpless() {
@@ -815,8 +1022,10 @@ impl Match {
                 v.y -= KNOCK_GRAVITY * dt;
                 p.pos += *v * dt;
                 p.pos = bot::collide_feet(Vec3::new(p.pos.x, p.pos.y, p.pos.z), solids, half).with_y(p.pos.y);
-                if p.pos.y <= 0.0 && v.y < 0.0 {
-                    p.pos.y = 0.0;
+                // Over the open hole a bot keeps falling, into the sewer.
+                let over_hole = racing && p.pos.x.abs() < sewer::HOLE_HALF && p.pos.z.abs() < sewer::HOLE_HALF;
+                if p.pos.y <= floor && v.y < 0.0 && !(over_hole && floor == 0.0) {
+                    p.pos.y = floor;
                     p.knock = None;
                 }
             }
@@ -844,7 +1053,7 @@ impl Match {
                         to_respawn.push(p.id);
                     }
                 }
-            } else if p.pos.y < -10.0 {
+            } else if p.pos.y < sewer::SEWER_FLOOR - 10.0 {
                 // Fell out of the world: counts as a knockout with no thrower credit.
                 p.respawn_timer = RESPAWN_SECS;
                 p.deaths += 1;
@@ -908,9 +1117,24 @@ impl Match {
         let ids: Vec<PlayerId> =
             self.players.iter().filter(|p| p.bot && p.alive() && !p.helpless()).map(|p| p.id).collect();
         for id in ids {
+            if self.hole_open() {
+                bot::race(self, id, dt);
+                continue;
+            }
             let actions = bot::think(self, id, dt);
             for a in actions {
                 self.apply(id, a);
+            }
+            // A bot that owns the golden ball yanks whoever catches it (after a beat).
+            if self.golden == Some(id) {
+                let team = self.player(id).map(|p| p.team);
+                let held_by_enemy = self.balls.iter().any(|b| {
+                    b.kind == BallKind::Golden
+                        && matches!(b.state, BallState::Held { by } if self.player(by).is_some_and(|h| Some(h.team) != team))
+                });
+                if held_by_enemy && self.rng.f32() < 2.5 * dt {
+                    self.apply(id, Action::Pull);
+                }
             }
         }
     }
@@ -970,10 +1194,12 @@ impl Match {
                             } else {
                                 let to = target - b.pos;
                                 let eta = to.length() / b.vel.length().max(1.0);
-                                if b.wrapping || eta < ball::CURVE_HOME_ETA {
+                                if b.wrapping || eta < ball::CURVE_FINAL_ETA {
                                     ball::guide_to(&mut b.vel, to, eta, dt);
-                                    bend = 0.0;
+                                } else {
+                                    ball::arc_to(&mut b.vel, b.pos, target, g, dt);
                                 }
+                                bend = 0.0;
                             }
                         }
                         _ => {
@@ -1024,6 +1250,7 @@ impl Match {
                     };
                     let b = &mut self.balls[bi];
                     if ball::fly_back(&mut b.pos, &mut b.vel, at, dt) {
+                        let golden = b.kind == BallKind::Golden;
                         if hands_full {
                             // Owner grabbed another ball meanwhile: drop it at their feet.
                             b.go_free();
@@ -1031,9 +1258,11 @@ impl Match {
                             b.state = BallState::Held { by: owner };
                             if let Some(p) = self.player_mut(owner) {
                                 p.holding = Some(bi);
-                                p.charged = true;
+                                p.charged = !golden;
                             }
-                            self.events.push(GameEvent::BoomerangBack { owner });
+                            if !golden {
+                                self.events.push(GameEvent::BoomerangBack { owner });
+                            }
                         }
                     }
                 }
@@ -1227,6 +1456,45 @@ impl Match {
         }
     }
 
+    /// The golden ball's owner tugs its string: whoever holds it (an enemy) is yanked
+    /// 5x a jump's height into the air toward the owner and the ball reels back; a ball
+    /// in flight or on the ground just reels back.
+    fn pull(&mut self, id: PlayerId) {
+        if self.golden != Some(id) {
+            return;
+        }
+        let Some(bi) = self.balls.iter().position(|b| b.kind == BallKind::Golden) else { return };
+        let Some(me) = self.player(id).map(|p| (p.pos, p.team)) else { return };
+        match self.balls[bi].state {
+            BallState::Held { by } if by == id => return,
+            BallState::Returning { .. } => return,
+            BallState::Held { by } => {
+                if self.player(by).is_some_and(|t| t.team == me.1) {
+                    return;
+                }
+                // A teammate holding it keeps it; the string only yanks enemies.
+                if let Some(t) = self.player_mut(by) {
+                    t.holding = None;
+                    t.powered = false;
+                    t.charged = false;
+                    let to = Vec3::new(me.0.x - t.pos.x, 0.0, me.0.z - t.pos.z);
+                    let air = 2.0 * YANK_LIFT / KNOCK_GRAVITY;
+                    let pull = to.length().min(YANK_PULL_MAX) / air;
+                    t.knock = Some(to.normalize_or_zero() * pull + Vec3::Y * YANK_LIFT);
+                    t.cover = CoverPose::None;
+                    t.dashing = false;
+                    t.slime = None;
+                    self.events.push(GameEvent::Yanked { by: id, target: by });
+                }
+            }
+            _ => self.events.push(GameEvent::Reeled { owner: id }),
+        }
+        let b = &mut self.balls[bi];
+        b.state = BallState::Returning { owner: id };
+        b.stacks = 0;
+        b.wrapping = false;
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             phase: self.phase,
@@ -1234,6 +1502,10 @@ impl Match {
             map: self.map,
             arena: self.arena,
             score: self.score,
+            rounds: self.rounds,
+            round: self.round,
+            race: self.race.clone(),
+            golden: self.golden,
             players: self
                 .players
                 .iter()
@@ -1283,6 +1555,20 @@ impl Match {
     }
 }
 
+/// Where a deathmatch goes after the sewer race: the other arena, at the other time of
+/// day. (The sewer itself is never a match map.)
+pub fn next_deathmatch_map(arena: ArenaId, map: MapId) -> (ArenaId, MapId) {
+    let arena = match arena {
+        ArenaId::Classic => ArenaId::Grand,
+        ArenaId::Grand => ArenaId::Classic,
+    };
+    let map = match map {
+        MapId::Day => MapId::Night,
+        MapId::Night => MapId::Day,
+    };
+    (arena, map)
+}
+
 /// Where along segment a->b (0..1) the ball first touches a body `height` tall at `feet`.
 pub fn segment_hits_body(a: Vec3, b: Vec3, feet: Vec3, height: f32) -> Option<f32> {
     let r = BODY_RADIUS + BALL_RADIUS;
@@ -1305,6 +1591,12 @@ pub struct Snapshot {
     pub map: MapId,
     pub arena: ArenaId,
     pub score: [u32; 2],
+    /// Deathmatch round wins, the round being played, sewer race finishers (first first),
+    /// and who owns the golden string ball.
+    pub rounds: [u32; 2],
+    pub round: u32,
+    pub race: Vec<PlayerId>,
+    pub golden: Option<PlayerId>,
     pub players: Vec<PlayerView>,
     pub balls: Vec<BallView>,
     pub events: Vec<GameEvent>,
@@ -1636,6 +1928,8 @@ mod tests {
         m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), std::f32::consts::PI);
         m.step(DT);
         m.players.iter_mut().find(|p| p.id == blue).unwrap().hp = 1;
+        // The deciding round: red already has two.
+        m.rounds = [ROUNDS_TO_WIN - 1, 0];
         throw_at(&mut m, red, Vec3::new(0.0, -0.05, -1.0));
         run(&mut m, 0.6);
         assert!(!m.player(blue).unwrap().alive());
@@ -2021,7 +2315,8 @@ mod tests {
     #[test]
     fn curve_tracks_a_runner() {
         let (mut m, red, blue) = duel();
-        m.apply(red, Action::Throw { aim: [0.0, -0.02, -1.0], charge: 0.3, curve: -1.0, lob: false });
+        // (A right curve: it swings out over the middle, not into the side wall.)
+        m.apply(red, Action::Throw { aim: [0.0, -0.02, -1.0], charge: 0.3, curve: 1.0, lob: false });
         run_strafing(&mut m, blue, -9.8, 1.5);
         assert_eq!(m.player(blue).unwrap().hp, MAX_HP - 1, "the curve followed blue");
     }
@@ -2097,5 +2392,227 @@ mod tests {
         assert_eq!(m.snapshot().players.iter().find(|p| p.id == red).unwrap().ride.unwrap().speed, 40.0);
         m.set_ride(red, Some(RideView { speed: f32::NAN, ..v }));
         assert!(m.player(red).unwrap().ride.is_none());
+    }
+
+    /// A 1v1 deathmatch that has started.
+    fn dm_duel() -> (Match, PlayerId, PlayerId) {
+        let (mut m, red, blue) = duel();
+        m.phase = Phase::Lobby;
+        m.set_mode(GameMode::Deathmatch);
+        m.start();
+        (m, red, blue)
+    }
+
+    /// Knock out `who` (the round ends at once in a 1v1).
+    fn wipe(m: &mut Match, who: PlayerId) {
+        let p = m.player_mut(who).unwrap();
+        p.hp = 0;
+        p.respawn_timer = RESPAWN_SECS;
+        m.step(DT);
+    }
+
+    #[test]
+    fn deathmatch_is_best_of_four_with_a_race_after_round_two() {
+        let (mut m, red, blue) = dm_duel();
+        assert_eq!((m.round, m.rounds), (1, [0, 0]));
+        wipe(&mut m, blue);
+        assert!(matches!(m.phase, Phase::RoundOver { winner: Team::Red, .. }), "{:?}", m.phase);
+        assert_eq!(m.rounds, [1, 0]);
+        run(&mut m, ROUND_BREAK_SECS + 0.1);
+        assert_eq!((m.phase, m.round), (Phase::Playing, 2));
+        assert!(m.player(blue).unwrap().alive(), "everyone back for round 2");
+        wipe(&mut m, red);
+        assert!(matches!(m.phase, Phase::Race { .. }), "round 2 done: sewer race, {:?}", m.phase);
+        assert!(m.hole_open());
+        assert_eq!(m.rounds, [1, 1]);
+        assert!(m.player(red).unwrap().alive() && m.player(blue).unwrap().alive());
+    }
+
+    #[test]
+    fn three_round_wins_take_the_match_and_two_all_goes_to_a_fifth() {
+        let (mut m, red, blue) = dm_duel();
+        m.rounds = [2, 0];
+        m.round = 3;
+        wipe(&mut m, blue);
+        assert_eq!(m.phase, Phase::Ended { winner: Team::Red });
+
+        let (mut m, red2, _) = dm_duel();
+        m.rounds = [2, 1];
+        m.round = 4;
+        wipe(&mut m, red2);
+        assert_eq!(m.rounds, [2, 2]);
+        assert!(matches!(m.phase, Phase::RoundOver { .. }));
+        run(&mut m, ROUND_BREAK_SECS + 0.1);
+        assert_eq!(m.round, 5, "a deciding fifth round");
+        let _ = red;
+    }
+
+    /// Put `who` down the hole at the start of the sewer.
+    fn drop_in(m: &mut Match, who: PlayerId) {
+        m.set_pose(who, Vec3::new(0.0, sewer::SEWER_FLOOR, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_race_winner_gets_the_golden_ball_on_the_next_map() {
+        let (mut m, red, blue) = dm_duel();
+        m.round = RACE_AFTER_ROUND;
+        m.start_race();
+        let (arena, map) = (m.arena, m.map);
+        // No throwing in the race.
+        m.apply(red, Action::Throw { aim: [0.0, 0.0, -1.0], charge: 1.0, curve: 0.0, lob: false });
+        drop_in(&mut m, red);
+        drop_in(&mut m, blue);
+        m.step(DT);
+        assert!(m.race.is_empty());
+        // Blue crosses the line first.
+        let finish = *sewer::waypoints().last().unwrap();
+        m.set_pose(blue, finish, 0.0);
+        m.step(DT);
+        assert_eq!(m.race, vec![blue]);
+        assert!(m.events.contains(&GameEvent::RaceFinished { player: blue, place: 1 }));
+        m.set_pose(red, finish, 0.0);
+        m.step(DT);
+        // Everyone is in: on to round 3, on the next map, golden ball in blue's hands.
+        assert_eq!((m.phase, m.round), (Phase::Playing, 3));
+        assert_eq!((m.arena, m.map), next_deathmatch_map(arena, map));
+        assert_ne!(m.arena, arena, "a different map");
+        assert_eq!(m.golden, Some(blue));
+        let gi = m.balls.iter().position(|b| b.kind == BallKind::Golden).expect("golden ball");
+        assert_eq!(m.balls[gi].state, BallState::Held { by: blue });
+        assert_eq!(m.player(blue).unwrap().holding, Some(gi));
+        assert!(m.player(red).unwrap().pos.y >= 0.0, "back up top");
+        assert!(m.snapshot().golden == Some(blue));
+    }
+
+    #[test]
+    fn stragglers_are_dropped_in_and_the_race_times_out() {
+        let (mut m, red, _blue) = dm_duel();
+        m.round = RACE_AFTER_ROUND;
+        m.start_race();
+        let tp = m.player(red).unwrap().teleports;
+        run(&mut m, RACE_DROP_SECS + 0.1);
+        let p = m.player(red).unwrap();
+        assert!(sewer::is_below(p.pos), "dropped in: {}", p.pos);
+        assert_eq!(p.teleports, tp + 1);
+        assert!(p.alive(), "falling in is not a knockout");
+        run(&mut m, RACE_MAX_SECS);
+        assert_eq!(m.phase, Phase::Playing);
+        assert_eq!(m.round, 3);
+    }
+
+    #[test]
+    fn bots_race_the_sewer_to_the_finish() {
+        let mut m = Match::new();
+        let a = m.add_player("Bot 1", true).unwrap();
+        let b = m.add_player("Bot 2", true).unwrap();
+        m.set_mode(GameMode::Deathmatch);
+        m.start();
+        m.round = RACE_AFTER_ROUND;
+        m.start_race();
+        let mut secs = 0.0;
+        while matches!(m.phase, Phase::Race { .. }) && secs < 90.0 {
+            m.step(DT);
+            secs += DT;
+        }
+        assert_eq!(m.phase, Phase::Playing, "race over after {secs:.0}s");
+        assert!(secs < RACE_DROP_SECS + 40.0, "bots got through in {secs:.0}s");
+        assert!(m.golden == Some(a) || m.golden == Some(b));
+    }
+
+    /// Round 3 with the golden ball in red's hands.
+    fn golden_duel() -> (Match, PlayerId, PlayerId) {
+        let (mut m, red, blue) = dm_duel();
+        m.golden = Some(red);
+        m.round = 2;
+        m.next_round();
+        // Just the golden ball (the lane is next to the slime ball's pad).
+        m.balls.retain(|b| b.kind == BallKind::Golden);
+        m.player_mut(red).unwrap().holding = Some(0);
+        m.set_pose(red, LANE, 0.0);
+        m.set_pose(blue, LANE + Vec3::new(0.0, 0.0, -10.0), std::f32::consts::PI);
+        assert!(matches!(m.player(red).unwrap().holding.map(|i| m.balls[i].kind), Some(BallKind::Golden)));
+        (m, red, blue)
+    }
+
+    #[test]
+    fn pulling_the_string_yanks_the_catcher_five_jumps_high() {
+        let (mut m, red, blue) = golden_duel();
+        let gi = m.player(red).unwrap().holding.unwrap();
+        // Blue catches the golden ball.
+        m.apply(red, Action::Throw { aim: [0.0, -0.02, -1.0], charge: 0.0, curve: 0.0, lob: false });
+        m.apply(blue, Action::Catch);
+        for _ in 0..40 {
+            m.step(DT);
+            if m.balls[gi].state == (BallState::Held { by: blue }) {
+                break;
+            }
+        }
+        assert_eq!(m.balls[gi].state, BallState::Held { by: blue }, "caught");
+        let start = m.player(blue).unwrap().pos;
+        m.apply(red, Action::Pull);
+        assert!(m.events.contains(&GameEvent::Yanked { by: red, target: blue }));
+        assert!(m.player(blue).unwrap().holding.is_none(), "the string tears it away");
+        let mut peak: f32 = 0.0;
+        for _ in 0..300 {
+            m.step(DT);
+            peak = peak.max(m.player(blue).unwrap().pos.y);
+        }
+        // A jump is 8 m/s at 22 m/s^2: 1.45 m. Five times that: ~7.3 m.
+        let jump = 8.0_f32 * 8.0 / (2.0 * 22.0);
+        assert!((peak / (5.0 * jump) - 1.0).abs() < 0.05, "peak {peak}");
+        let p = m.player(blue).unwrap();
+        assert!(p.knock.is_none() && p.pos.y == 0.0, "landed");
+        assert!(p.pos.distance(LANE) < start.distance(LANE) - 3.0, "dragged toward red");
+        assert_eq!(m.balls[gi].state, BallState::Held { by: red }, "reeled back to red");
+    }
+
+    #[test]
+    fn only_the_owner_can_pull_and_a_loose_ball_just_reels_in() {
+        let (mut m, red, blue) = golden_duel();
+        let gi = m.player(red).unwrap().holding.unwrap();
+        // It was thrown, missed and lies on the floor a way off.
+        m.player_mut(red).unwrap().holding = None;
+        m.balls[gi].state = BallState::Free;
+        m.balls[gi].pos = LANE + Vec3::new(-8.0, 0.3, 4.0);
+        m.balls[gi].vel = Vec3::ZERO;
+        m.apply(blue, Action::Pull);
+        assert!(!matches!(m.balls[gi].state, BallState::Returning { .. }), "not blue's string");
+        m.apply(red, Action::Pull);
+        assert_eq!(m.balls[gi].state, BallState::Returning { owner: red });
+        run(&mut m, 2.0);
+        assert_eq!(m.balls[gi].state, BallState::Held { by: red });
+        assert!(!m.player(red).unwrap().charged, "the golden ball is not a boomerang");
+    }
+
+    #[test]
+    fn a_teammate_holding_the_golden_ball_keeps_it() {
+        let mut m = Match::new();
+        let a = m.add_player("a", false).unwrap();
+        let _b = m.add_player("b", false).unwrap();
+        let c = m.add_player("c", false).unwrap();
+        m.set_mode(GameMode::Deathmatch);
+        m.start();
+        assert_eq!(m.player(a).unwrap().team, m.player(c).unwrap().team);
+        m.golden = Some(a);
+        m.round = 2;
+        m.next_round();
+        let gi = m.balls.iter().position(|b| b.kind == BallKind::Golden).unwrap();
+        m.player_mut(a).unwrap().holding = None;
+        m.player_mut(c).unwrap().holding = Some(gi);
+        m.balls[gi].state = BallState::Held { by: c };
+        m.apply(a, Action::Pull);
+        assert_eq!(m.balls[gi].state, BallState::Held { by: c });
+        assert!(m.player(c).unwrap().knock.is_none());
+        assert!(m.events.iter().all(|e| !matches!(e, GameEvent::Yanked { .. } | GameEvent::Reeled { .. })));
+    }
+
+    #[test]
+    fn going_back_to_the_lobby_drops_the_golden_ball() {
+        let (mut m, red, _) = golden_duel();
+        m.phase = Phase::Ended { winner: Team::Red };
+        m.to_lobby();
+        assert!(m.balls.iter().all(|b| b.kind != BallKind::Golden));
+        assert!(m.player(red).unwrap().holding.is_none());
+        assert_eq!(m.golden, None);
     }
 }
